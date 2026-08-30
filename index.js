@@ -155,6 +155,26 @@ async function fetchAndCacheGame(annotatedid) {
 // staleness check here unlike players - a finished historical game's own
 // move-by-move content never changes once played, only the small chance it
 // wasn't in our database yet.
+// GET /game/random - picks a random annotatedid straight out of the
+// in-memory allanno.csv index (already loaded at startup for the player-
+// games lookup, no DB query needed here) and hands it back for the
+// frontend to navigate to via the normal /game/:annotatedid path. Placed
+// BEFORE that route on purpose - Express matches routes in registration
+// order, so a literal "/game/random" registered after "/game/:annotatedid"
+// would never be reached (it'd match the param route first, with
+// "random" as the (invalid) id). Doesn't guarantee the picked id is
+// actually fetchable (cross-tables' own API is occasionally down for a
+// specific game, as already seen once) - the normal Viewer error state
+// already handles that if it happens, and a re-roll is one click away.
+app.get('/game/random', (req, res) => {
+  for (let i = 0; i < 10; i++) {
+    const row = annoRows[Math.floor(Math.random() * annoRows.length)];
+    const annotatedid = Number(row.ID);
+    if (annotatedid) return res.json({ annotatedid });
+  }
+  res.status(500).json({ error: 'failed to pick a random game' });
+});
+
 app.get('/game/:annotatedid', async (req, res) => {
   const annotatedid = Number(req.params.annotatedid);
   if (!annotatedid || annotatedid < 1) {
