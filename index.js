@@ -148,6 +148,44 @@ app.get('/player/:id', async (req, res) => {
   }
 });
 
+// GET /players/search?q=name - simple name search over players already
+// cached in this database. No live cross-tables fallback here (unlike
+// /player/:id) - search only makes sense over players we already know
+// about, not the full ~29,000-player universe.
+app.get('/players/search', async (req, res) => {
+  const q = (req.query.q || '').trim();
+  if (!q) return res.json({ results: [] });
+  try {
+    const { rows } = await pool.query(
+      `SELECT playerid, name, currrating, twlrating, cswrating, photourl
+       FROM players WHERE name ILIKE $1
+       ORDER BY currrating DESC NULLS LAST LIMIT 25`,
+      [`%${q}%`]
+    );
+    res.json({ results: rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'internal error', detail: err.message });
+  }
+});
+
+// GET /players/rankings?limit=100 - top N cached players by current rating.
+app.get('/players/rankings', async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 100, 500);
+  try {
+    const { rows } = await pool.query(
+      `SELECT playerid, name, currrating, twlrating, cswrating, photourl
+       FROM players WHERE currrating IS NOT NULL
+       ORDER BY currrating DESC LIMIT $1`,
+      [limit]
+    );
+    res.json({ results: rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'internal error', detail: err.message });
+  }
+});
+
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => console.log(`cross-tables-api listening on :${PORT}`));
