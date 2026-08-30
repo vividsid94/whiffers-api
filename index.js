@@ -79,10 +79,40 @@ async function fetchJson(url) {
   return res.json();
 }
 
-// GET /player/:id - player info (DB-first, live-fetch-and-cache on miss so
-// this works for ANY cross-tables player, not just the pre-populated
-// active-players set) + their annotated games list (from the in-memory
-// allanno.csv index, not DB-dependent).
+// Cross-tables is the only source of truth for ratings - this database
+// never computes or derives anything itself, it's purely a cache of
+// cross-tables' own answer. STALE_MS is how long a cached row is trusted
+// before treating it like a miss and asking cross-tables again, rather than
+// repeating a possibly-outdated answer forever. 24h is a starting default,
+// not a tuned value - cheap to change.
+const STALE_MS = 24 * 60 * 60 * 1000;
+
+// Live-fetches one player from cross-tables and upserts the result -
+// shared by both the "never seen this player" and "seen them, but the
+// cached row is stale" paths below, so there's one implementation instead
+// of two copies that could drift.
+async function fetchAndCachePlayer(playerid) {
+  const playerResp = await fetchJson(`${CROSSTABLES_API}/player.php?player=${playerid}`);
+  const p = playerResp.player;
+  if (!p) return null;
+
+  const upsertResult = await pool.query(
+    `INSERT INTO players (playerid, name, currrating, twlrating, cswrating, peakrating, photourl)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)
+     ON CONFLICT (playerid) DO UPDATE SET
+       name=$2, currrating=$3, twlrating=$4, cswrating=$5, peakrating=$6, photourl=$7, updated_at=now()
+     RETURNING *`,
+    [playerid, p.name, Number(p.currrating) || null, Number(p.twlrating) || null,
+     Number(p.cswrating) || null, Number(p.peakrating) || null, p.photourl || null]
+  );
+  return upsertResult.rows[0];
+}
+
+// GET /player/:id - player info (DB-first, live-fetch-and-cache on miss OR
+// on a stale cached row, so this works for ANY cross-tables player, not
+// just the pre-populated active-players set, and doesn't repeat an
+// outdated rating forever) + their annotated games list (from the
+// in-memory allanno.csv index, not DB-dependent).
 app.get('/player/:id', async (req, res) => {
   const playerid = Number(req.params.id);
   if (!playerid || playerid < 1) {
@@ -92,25 +122,19 @@ app.get('/player/:id', async (req, res) => {
   try {
     let { rows } = await pool.query('SELECT * FROM players WHERE playerid = $1', [playerid]);
     let player = rows[0];
+    const isStale = player && (Date.now() - new Date(player.updated_at).getTime()) > STALE_MS;
 
-    if (!player) {
-      // Lazy fetch-and-cache: this player isn't pre-populated (not in the
-      // active-players set, hasn't appeared in an ingested game) - fetch
-      // live once, then it's cached for every future request.
-      const playerResp = await fetchJson(`${CROSSTABLES_API}/player.php?player=${playerid}`);
-      const p = playerResp.player;
-      if (!p) return res.status(404).json({ error: 'player not found' });
-
-      const upsertResult = await pool.query(
-        `INSERT INTO players (playerid, name, currrating, twlrating, cswrating, peakrating, photourl)
-         VALUES ($1,$2,$3,$4,$5,$6,$7)
-         ON CONFLICT (playerid) DO UPDATE SET
-           name=$2, currrating=$3, twlrating=$4, cswrating=$5, peakrating=$6, photourl=$7, updated_at=now()
-         RETURNING *`,
-        [playerid, p.name, Number(p.currrating) || null, Number(p.twlrating) || null,
-         Number(p.cswrating) || null, Number(p.peakrating) || null, p.photourl || null]
-      );
-      player = upsertResult.rows[0];
+    if (!player || isStale) {
+      const fresh = await fetchAndCachePlayer(playerid);
+      if (fresh) {
+        player = fresh;
+      } else if (!player) {
+        // Never seen before AND cross-tables has nothing for this ID.
+        return res.status(404).json({ error: 'player not found' });
+      }
+      // else: cross-tables fetch failed to return a player but we still
+      // have a stale row - serve the stale data rather than a hard error,
+      // same "graceful degrade" reasoning as elsewhere in this app.
     }
 
     const games = (gamesByPlayer.get(playerid) || [])
