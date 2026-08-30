@@ -169,14 +169,23 @@ app.get('/players/search', async (req, res) => {
   }
 });
 
-// GET /players/rankings?limit=100 - top N cached players by current rating.
+// GET /players/rankings?limit=100 - top N cached players by their best
+// rating. NOT `currrating` alone - confirmed directly against cross-tables'
+// own API (and every one of the 990 real rows in this database) that
+// currrating IS twlrating, just under a more general-sounding name. Filtering/
+// sorting by currrating alone silently excludes CSW-only players entirely
+// (not just ranks them lower) - e.g. Wellington Jighere, a real 2327-CSW-
+// rated player with zero TWL games, has currrating=NULL and was completely
+// missing from this endpoint before this fix. GREATEST(twlrating, cswrating)
+// ignores NULLs and only returns NULL if both are null (Postgres behavior),
+// so this correctly ranks everyone by whichever rating they actually have.
 app.get('/players/rankings', async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 100, 500);
   try {
     const { rows } = await pool.query(
       `SELECT playerid, name, currrating, twlrating, cswrating, photourl
-       FROM players WHERE currrating IS NOT NULL
-       ORDER BY currrating DESC LIMIT $1`,
+       FROM players WHERE twlrating IS NOT NULL OR cswrating IS NOT NULL
+       ORDER BY GREATEST(twlrating, cswrating) DESC LIMIT $1`,
       [limit]
     );
     res.json({ results: rows });
