@@ -108,6 +108,76 @@ async function fetchAndCachePlayer(playerid) {
   return upsertResult.rows[0];
 }
 
+// Copied verbatim from whiffers/scripts/cross-tables-db/ingest.mjs's own
+// decodeGamehistory - the gamehistory field is base64-encoded binary (a
+// protobuf message), not base64 plain text. Real GCG text starts at
+// '#player1'; the trailer's own leading tag byte varies by field number
+// (not always one fixed marker byte), so this scans for the first
+// non-printable byte rather than relying on a single specific marker.
+function decodeGamehistory(base64) {
+  const decoded = Buffer.from(base64, 'base64').toString('binary');
+  const gcgStart = decoded.indexOf('#player1');
+  if (gcgStart === -1) return null;
+  let end = decoded.length;
+  for (let i = gcgStart; i < decoded.length; i++) {
+    const c = decoded.charCodeAt(i);
+    const printable = (c >= 0x20 && c <= 0x7e) || c === 0x0a || c === 0x0d || c === 0x09;
+    if (!printable) { end = i; break; }
+  }
+  return decoded.slice(gcgStart, end);
+}
+
+// Live-fetches and caches one game's content on demand. Deliberately lean
+// compared to the offline ingest.mjs batch tool: player1id/player2id/
+// tourneyid are left NULL here rather than resolved, since both columns are
+// foreign keys (players.playerid / tourneys.tourneyid) - populating them
+// would require upserting those related rows first (extra API calls) just
+// to satisfy the constraint, for data the Viewer doesn't actually need to
+// render a game's board. lexicon/round/source_url have no such constraint
+// and are populated directly from the one API call already being made.
+async function fetchAndCacheGame(annotatedid) {
+  const raw = await fetchJson(`${CROSSTABLES_API}/annotated.php?annotatedid=${annotatedid}`);
+  const gcg_text = decodeGamehistory(raw.gamehistory);
+  if (!gcg_text) return null;
+
+  const upsertResult = await pool.query(
+    `INSERT INTO annotated_games (annotatedid, lexicon, gcg_text, source_url, round)
+     VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT (annotatedid) DO UPDATE SET gcg_text = EXCLUDED.gcg_text
+     RETURNING *`,
+    [annotatedid, raw.lexicon || null, gcg_text, raw.source || null, raw.round || null]
+  );
+  return upsertResult.rows[0];
+}
+
+// GET /game/:annotatedid - a single game's raw GCG content (DB-first, live-
+// fetch-and-cache on miss, same pattern as /player/:id below). No
+// staleness check here unlike players - a finished historical game's own
+// move-by-move content never changes once played, only the small chance it
+// wasn't in our database yet.
+app.get('/game/:annotatedid', async (req, res) => {
+  const annotatedid = Number(req.params.annotatedid);
+  if (!annotatedid || annotatedid < 1) {
+    return res.status(400).json({ error: 'invalid annotatedid' });
+  }
+
+  try {
+    let { rows } = await pool.query('SELECT * FROM annotated_games WHERE annotatedid = $1', [annotatedid]);
+    let game = rows[0];
+
+    if (!game || !game.gcg_text) {
+      const fresh = await fetchAndCacheGame(annotatedid);
+      if (fresh) game = fresh;
+      else if (!game) return res.status(404).json({ error: 'game not found' });
+    }
+
+    res.json({ game });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'internal error', detail: err.message });
+  }
+});
+
 // GET /player/:id - player info (DB-first, live-fetch-and-cache on miss OR
 // on a stale cached row, so this works for ANY cross-tables player, not
 // just the pre-populated active-players set, and doesn't repeat an
