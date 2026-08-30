@@ -198,6 +198,83 @@ app.get('/game/:annotatedid', async (req, res) => {
   }
 });
 
+// GET /game/:annotatedid/ratings - resolves both players' ratings for one
+// specific annotated game: their REAL rating AT THE TIME of that game, if
+// it was part of a tracked tournament, falling back to their CURRENT
+// rating (in the game's own lexicon) for untagged/casual games. Player/
+// tourney identity comes straight from the already-in-memory allanno.csv
+// index (player1ID/player2ID/tourneyID/lexicon columns), not a fresh
+// annotated.php call - cheaper, and sidesteps that endpoint's own real
+// flakiness (already seen 500 on a specific game this session) entirely
+// for this feature.
+//
+// The tournament case uses cross-tables' own results.php - a player's
+// per-tourney result includes a games[] array, one entry per round, each
+// carrying that exact round's own annotatedid plus `rating`/
+// `opponentrating` for both sides of that specific game (confirmed
+// directly: game 36909's own entry shows Jackson Smylie's rating as 2007
+// there, matching oldrating for that whole tourney - ratings don't drift
+// mid-tournament, they're fixed going in). One call (as player1) is
+// enough for both sides' numbers, no need to also query as player2.
+//
+// A third case exists too: some games are between fully anonymous/
+// unlinked players (playerid 0 in allanno.csv - never had a real cross-
+// tables account) - nothing to look up for those, historical or current.
+app.get('/game/:annotatedid/ratings', async (req, res) => {
+  const annotatedid = Number(req.params.annotatedid);
+  if (!annotatedid || annotatedid < 1) {
+    return res.status(400).json({ error: 'invalid annotatedid' });
+  }
+
+  const row = annoRows.find((r) => Number(r.ID) === annotatedid);
+  if (!row) return res.status(404).json({ error: 'game not found' });
+
+  const player1id = Number(row.player1ID) || 0;
+  const player2id = Number(row.player2ID) || 0;
+  const tourneyid = Number(row.tourneyID) || 0;
+  const lexicon = row.lexicon || null;
+
+  if (!player1id || !player2id) {
+    return res.json({ source: 'unknown', player1Rating: null, player2Rating: null, lexicon });
+  }
+
+  try {
+    if (tourneyid) {
+      const data = await fetchJson(`${CROSSTABLES_API}/results.php?tourney=${tourneyid}&player=${player1id}`);
+      for (const result of data.results || []) {
+        const game = (result.games || []).find((g) => Number(g.annotatedid) === annotatedid);
+        if (game) {
+          return res.json({
+            source: 'tournament',
+            tourneyname: result.tourneyname || null,
+            player1Rating: Number(game.rating) || null,
+            player2Rating: Number(game.opponentrating) || null,
+            lexicon,
+          });
+        }
+      }
+      // This specific game wasn't in that tourney's own results (a real
+      // data quirk, not expected but not fatal either) - fall through to
+      // current rating rather than erroring out.
+    }
+
+    const ratingField = (lexicon || '').toUpperCase().startsWith('CSW') ? 'cswrating' : 'twlrating';
+    const [p1, p2] = await Promise.all([
+      fetchJson(`${CROSSTABLES_API}/player.php?player=${player1id}`),
+      fetchJson(`${CROSSTABLES_API}/player.php?player=${player2id}`),
+    ]);
+    res.json({
+      source: 'current',
+      player1Rating: Number(p1.player?.[ratingField]) || null,
+      player2Rating: Number(p2.player?.[ratingField]) || null,
+      lexicon,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'internal error', detail: err.message });
+  }
+});
+
 // GET /player/:id - player info (DB-first, live-fetch-and-cache on miss OR
 // on a stale cached row, so this works for ANY cross-tables player, not
 // just the pre-populated active-players set, and doesn't repeat an
