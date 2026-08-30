@@ -238,48 +238,29 @@ app.get('/player/:id', async (req, res) => {
   }
 });
 
-// GET /players/search?q=name - simple name search over players already
-// cached in this database. No live cross-tables fallback here (unlike
-// /player/:id) - search only makes sense over players we already know
-// about, not the full ~29,000-player universe.
-app.get('/players/search', async (req, res) => {
-  const q = (req.query.q || '').trim();
-  if (!q) return res.json({ results: [] });
-  try {
-    const { rows } = await pool.query(
-      `SELECT playerid, name, currrating, twlrating, cswrating, photourl
-       FROM players WHERE name ILIKE $1
-       ORDER BY currrating DESC NULLS LAST LIMIT 25`,
-      [`%${q}%`]
-    );
-    res.json({ results: rows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'internal error', detail: err.message });
-  }
-});
-
-// GET /players/rankings?limit=100 - top N cached players. The WHERE clause
-// still can't be `currrating` alone - confirmed directly against cross-
-// tables' own API (and every one of the 990 real rows in this database)
-// that currrating IS twlrating, just under a more general-sounding name,
-// and filtering by it alone silently excludes CSW-only players entirely
-// (not just ranks them lower) - e.g. Wellington Jighere, a real 2327-CSW-
-// rated player with zero TWL games, has currrating=NULL. GREATEST(twlrating,
-// cswrating) ignores NULLs and only returns NULL if both are, so this still
-// includes anyone with either rating.
+// GET /players/rankings?limit=2000 - every cached player with a rating
+// (978 as of writing - small enough to just send the whole set and let the
+// frontend search/sort it client-side, rather than reissuing a differently-
+// sorted/filtered query per interaction). The default limit is set well
+// above that count on purpose - an earlier version of this endpoint used a
+// real LIMIT 100 to only return the top players, and that silently broke
+// once the frontend started re-sorting client-side: a player who's null in
+// whatever column the SQL itself ordered by (e.g. Wellington Jighere, a
+// real 2327-CSW-rated player with zero TWL games) never made it into the
+// top 100 AT ALL once 100+ other players had a real TWL rating, so no
+// amount of client-side re-sorting could ever surface him - the row simply
+// wasn't there to sort. Sending everyone sidesteps that class of bug
+// entirely: nobody can be excluded by a LIMIT that ran before the sort the
+// user actually asked for.
 //
-// The ORDER BY is plain NWL (twlrating), though, not GREATEST of the two -
-// a blended "whichever's higher" ranking doesn't correspond to any real
-// leaderboard a player would recognize as either one. twlrating-null
-// players (CSW-only, like Wellington) sort to the bottom of this default
-// view instead of disappearing - NULLS LAST is required here since
-// Postgres's own default for a DESC sort is NULLS FIRST, which would put
-// them at the top for the wrong reason. The frontend's own click-to-sort
-// (re-sorting this same already-fetched array client-side) is what
-// actually surfaces CSW-dominant players near the top, on request.
+// The WHERE clause still can't be `currrating` alone - confirmed directly
+// against cross-tables' own API (and every one of the 990 real rows in this
+// database) that currrating IS twlrating, just under a more general-
+// sounding name, and filtering by it alone silently excludes CSW-only
+// players entirely. GREATEST(twlrating, cswrating) ignores NULLs and only
+// returns NULL if both are, so this still includes anyone with either.
 app.get('/players/rankings', async (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 100, 500);
+  const limit = Math.min(Number(req.query.limit) || 2000, 5000);
   try {
     const { rows } = await pool.query(
       `SELECT playerid, name, currrating, twlrating, cswrating, photourl
