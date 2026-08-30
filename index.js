@@ -259,23 +259,32 @@ app.get('/players/search', async (req, res) => {
   }
 });
 
-// GET /players/rankings?limit=100 - top N cached players by their best
-// rating. NOT `currrating` alone - confirmed directly against cross-tables'
-// own API (and every one of the 990 real rows in this database) that
-// currrating IS twlrating, just under a more general-sounding name. Filtering/
-// sorting by currrating alone silently excludes CSW-only players entirely
+// GET /players/rankings?limit=100 - top N cached players. The WHERE clause
+// still can't be `currrating` alone - confirmed directly against cross-
+// tables' own API (and every one of the 990 real rows in this database)
+// that currrating IS twlrating, just under a more general-sounding name,
+// and filtering by it alone silently excludes CSW-only players entirely
 // (not just ranks them lower) - e.g. Wellington Jighere, a real 2327-CSW-
-// rated player with zero TWL games, has currrating=NULL and was completely
-// missing from this endpoint before this fix. GREATEST(twlrating, cswrating)
-// ignores NULLs and only returns NULL if both are null (Postgres behavior),
-// so this correctly ranks everyone by whichever rating they actually have.
+// rated player with zero TWL games, has currrating=NULL. GREATEST(twlrating,
+// cswrating) ignores NULLs and only returns NULL if both are, so this still
+// includes anyone with either rating.
+//
+// The ORDER BY is plain NWL (twlrating), though, not GREATEST of the two -
+// a blended "whichever's higher" ranking doesn't correspond to any real
+// leaderboard a player would recognize as either one. twlrating-null
+// players (CSW-only, like Wellington) sort to the bottom of this default
+// view instead of disappearing - NULLS LAST is required here since
+// Postgres's own default for a DESC sort is NULLS FIRST, which would put
+// them at the top for the wrong reason. The frontend's own click-to-sort
+// (re-sorting this same already-fetched array client-side) is what
+// actually surfaces CSW-dominant players near the top, on request.
 app.get('/players/rankings', async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 100, 500);
   try {
     const { rows } = await pool.query(
       `SELECT playerid, name, currrating, twlrating, cswrating, photourl
        FROM players WHERE twlrating IS NOT NULL OR cswrating IS NOT NULL
-       ORDER BY GREATEST(twlrating, cswrating) DESC LIMIT $1`,
+       ORDER BY twlrating DESC NULLS LAST LIMIT $1`,
       [limit]
     );
     res.json({ results: rows });
