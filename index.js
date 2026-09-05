@@ -352,6 +352,83 @@ app.get('/players/rankings', async (req, res) => {
   }
 });
 
+// --- Monster Puzzle -------------------------------------------------------
+// Precomputed puzzle positions - whiffers/scripts/generateMonsterPuzzles.mjs
+// writes rows directly into this table (see that script's own header for
+// how a position qualifies). category/margin/word_length are real indexed
+// columns specifically for this filtering; board/move history/candidates/
+// pool are JSONB, returned to the client as-is - pg already parses JSONB
+// columns back into real objects/arrays on SELECT, no manual JSON.parse
+// needed here.
+function mapMonsterPuzzleRow(row) {
+  return {
+    id: row.id,
+    sourceWord: row.source_word,
+    sourceGame: row.source_game,
+    category: row.category,
+    margin: Number(row.margin),
+    rack: row.rack,
+    opponentRack: row.opponent_rack,
+    currentPlayer: row.current_player,
+    player1Name: row.player1_name,
+    player2Name: row.player2_name,
+    player1Points: row.player1_points,
+    player2Points: row.player2_points,
+    board: row.board,
+    pausedMove: row.paused_move,
+    pausedCandidates: row.paused_candidates,
+    moveHistory: row.move_history,
+    blankTiles: row.blank_tiles,
+    pool: row.pool,
+  };
+}
+
+// GET /monster-puzzle/random?category=monster|overlap&minMargin=&minWordLength=&excludeGame=
+// Picks one random matching row - ORDER BY RANDOM() is fine at this table's
+// current size (hundreds to low thousands of rows), would need a different
+// approach (TABLESAMPLE, or a precomputed random-order key column) well
+// before that stops being true. Registered BEFORE /monster-puzzle/:id for
+// the same reason /game/random precedes /game/:annotatedid above - Express
+// matches route registration order, so the literal path has to come first
+// or ":id" would swallow "random" as an (invalid) id.
+app.get('/monster-puzzle/random', async (req, res) => {
+  const { category, minMargin, minWordLength, excludeGame } = req.query;
+  const conditions = [];
+  const params = [];
+
+  if (category) { params.push(category); conditions.push(`category = $${params.length}`); }
+  if (minMargin) { params.push(Number(minMargin)); conditions.push(`margin >= $${params.length}`); }
+  if (minWordLength) { params.push(Number(minWordLength)); conditions.push(`word_length >= $${params.length}`); }
+  if (excludeGame) { params.push(excludeGame); conditions.push(`source_game != $${params.length}`); }
+
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  try {
+    const { rows } = await pool.query(`SELECT * FROM monster_puzzles ${where} ORDER BY RANDOM() LIMIT 1`, params);
+    if (rows.length === 0) return res.status(404).json({ error: 'no matching puzzle found' });
+    res.json({ entry: mapMonsterPuzzleRow(rows[0]) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'internal error', detail: err.message });
+  }
+});
+
+// GET /monster-puzzle/:id - one specific puzzle by id, for resolving a
+// shared link (whiffers' own shareLinkFunctions.js {type:'monster', id} payload).
+app.get('/monster-puzzle/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!id || id < 1) return res.status(400).json({ error: 'invalid id' });
+
+  try {
+    const { rows } = await pool.query('SELECT * FROM monster_puzzles WHERE id = $1', [id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'puzzle not found' });
+    res.json({ entry: mapMonsterPuzzleRow(rows[0]) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'internal error', detail: err.message });
+  }
+});
+
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => console.log(`cross-tables-api listening on :${PORT}`));
