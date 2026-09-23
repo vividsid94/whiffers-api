@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
 import fs from 'fs';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { parse } from 'csv-parse/sync';
 
@@ -13,9 +14,19 @@ const DATABASE_URL = process.env.DATABASE_URL;
 // .pathname) handles Windows drive-letter URLs correctly.
 const ALLANNO_CSV = process.env.ALLANNO_CSV || fileURLToPath(new URL('./allanno.csv', import.meta.url));
 const CROSSTABLES_API = 'https://api.cross-tables.com';
+// One shared secret gating POST /registry (see below) - a "temp password"
+// as asked for, not a per-user account system. Required at startup same as
+// DATABASE_URL so a misconfigured deploy fails loudly instead of silently
+// accepting every upload (or every upload failing confusingly at request
+// time instead of at boot).
+const UPLOAD_PASSWORD = process.env.UPLOAD_PASSWORD;
 
 if (!DATABASE_URL) {
   console.error('DATABASE_URL env var is required');
+  process.exit(1);
+}
+if (!UPLOAD_PASSWORD) {
+  console.error('UPLOAD_PASSWORD env var is required');
   process.exit(1);
 }
 
@@ -68,6 +79,10 @@ console.log(`Indexed games for ${gamesByPlayer.size} distinct players`);
 
 const app = express();
 app.use(cors());
+// Only POST /registry has a body - a 1MB cap is generous headroom for a
+// GCG transcript (plain text, real games top out well under 100KB) while
+// still bounding request size.
+app.use(express.json({ limit: '1mb' }));
 
 async function fetchJson(url) {
   const res = await fetch(url);
@@ -269,6 +284,104 @@ app.get('/game/:annotatedid/ratings', async (req, res) => {
       player2Rating: Number(p2.player?.[ratingField]) || null,
       lexicon,
     });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'internal error', detail: err.message });
+  }
+});
+
+// --- Internal registry -----------------------------------------------------
+// User-uploaded games, gated by UPLOAD_PASSWORD - a second game source
+// alongside cross-tables' own annotated_games, for GCGs that never came
+// from cross-tables at all (schema.sql's registry_games table). Viewing is
+// open to anyone; only POST (uploading) checks the password.
+
+// Same #player1/#player2/#lexicon header scan whiffers' own gcgParser.js
+// runs client-side (kept in exact sync deliberately - both read the same
+// GCG convention) - used here purely so GET /registry's list view has a
+// name/lexicon to show without re-parsing the full GCG on every request.
+function extractGcgMeta(gcgText) {
+  let player1Name = null;
+  let player2Name = null;
+  let lexicon = null;
+  for (const line of gcgText.split('\n')) {
+    let m;
+    if ((m = line.match(/^#player1\s+\S+\s+(.+)$/))) player1Name = m[1].trim();
+    else if ((m = line.match(/^#player2\s+\S+\s+(.+)$/))) player2Name = m[1].trim();
+    else if ((m = line.match(/^#lexicon\s+(\S+)/))) lexicon = m[1];
+  }
+  return { player1Name, player2Name, lexicon };
+}
+
+// Constant-time compare so a wrong guess can't be timed character-by-
+// character - low-stakes for a shared "temp password," but free to do
+// correctly with crypto.timingSafeEqual, so no reason not to. Both buffers
+// have to be equal LENGTH before timingSafeEqual will even compare them
+// (it throws otherwise), hence the length check up front.
+function checkUploadPassword(candidate) {
+  const a = Buffer.from(String(candidate ?? ''));
+  const b = Buffer.from(UPLOAD_PASSWORD);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+// POST /registry - password-gated upload. id is a short random slug
+// prefixed with a letter (never purely digits), deliberately NOT in the
+// same id space as cross-tables' own numeric annotatedid - Viewer.jsx's
+// route param tells the two apart with a plain "is this all digits?"
+// check and hits this table instead of /game/:annotatedid when it isn't.
+app.post('/registry', async (req, res) => {
+  const { password, gcgText, label, uploadedBy } = req.body || {};
+  if (!checkUploadPassword(password)) {
+    return res.status(401).json({ error: 'incorrect password' });
+  }
+  if (typeof gcgText !== 'string' || !gcgText.includes('#player1')) {
+    return res.status(400).json({ error: 'gcgText must be a GCG transcript (missing #player1 header)' });
+  }
+
+  const id = 'w' + crypto.randomBytes(6).toString('hex');
+  const { player1Name, player2Name, lexicon } = extractGcgMeta(gcgText);
+
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO registry_games (id, label, player1_name, player2_name, lexicon, gcg_text, uploaded_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [id, label || null, player1Name, player2Name, lexicon, gcgText, uploadedBy || null]
+    );
+    res.status(201).json({ game: rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'internal error', detail: err.message });
+  }
+});
+
+// GET /registry - browse list, newest first. No gcg_text in the response -
+// this is a picker list, not the game itself (GET /registry/:id below).
+// Registered before /registry/:id on purpose, same reasoning as /game/random
+// vs /game/:annotatedid above, even though "registry" itself could never
+// collide with a generated 'w'+hex id - consistent ordering either way.
+app.get('/registry', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, label, player1_name, player2_name, lexicon, uploaded_by, created_at
+       FROM registry_games ORDER BY created_at DESC LIMIT 200`
+    );
+    res.json({ results: rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'internal error', detail: err.message });
+  }
+});
+
+// GET /registry/:id - one registry game's raw GCG, same { game: { gcg_text,
+// lexicon, ... } } shape GET /game/:annotatedid already returns, so
+// Viewer.jsx runs it through the exact same parseGCGToMoveHistory call
+// either way - only the fetch URL differs.
+app.get('/registry/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { rows } = await pool.query('SELECT * FROM registry_games WHERE id = $1', [id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'game not found' });
+    res.json({ game: rows[0] });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'internal error', detail: err.message });
