@@ -38,6 +38,22 @@ const pool = new pg.Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthor
 // a well-known pg gotcha, not optional defensive code.
 pool.on('error', (err) => console.error('Unexpected idle client error on pool:', err.message));
 
+// Self-healing schema check, run once at boot - this repo otherwise only
+// does schema changes via one-off scripts in whiffers/scripts/cross-tables-db
+// run by hand against DATABASE_URL (see add-players-location-column.mjs
+// there), which requires DB tooling/credentials on whoever's deploying.
+// ADD COLUMN IF NOT EXISTS is idempotent and cheap, so running it
+// unconditionally on every boot is harmless once the column already exists -
+// this means a plain push-and-redeploy of this service is enough on its
+// own, no separate manual migration step required.
+async function ensureSchema() {
+  try {
+    await pool.query('ALTER TABLE players ADD COLUMN IF NOT EXISTS location TEXT');
+  } catch (err) {
+    console.error('Schema check failed (location column):', err.message);
+  }
+}
+
 // Log-and-continue rather than let an unhandled rejection silently kill the
 // process (Node's default since v15) - added while diagnosing a mystery
 // clean-exit-with-no-error-message during local testing, useful defensive
@@ -112,13 +128,13 @@ async function fetchAndCachePlayer(playerid) {
   if (!p) return null;
 
   const upsertResult = await pool.query(
-    `INSERT INTO players (playerid, name, currrating, twlrating, cswrating, peakrating, photourl)
-     VALUES ($1,$2,$3,$4,$5,$6,$7)
+    `INSERT INTO players (playerid, name, currrating, twlrating, cswrating, peakrating, photourl, location)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
      ON CONFLICT (playerid) DO UPDATE SET
-       name=$2, currrating=$3, twlrating=$4, cswrating=$5, peakrating=$6, photourl=$7, updated_at=now()
+       name=$2, currrating=$3, twlrating=$4, cswrating=$5, peakrating=$6, photourl=$7, location=$8, updated_at=now()
      RETURNING *`,
     [playerid, p.name, Number(p.currrating) || null, Number(p.twlrating) || null,
-     Number(p.cswrating) || null, Number(p.peakrating) || null, p.photourl || null]
+     Number(p.cswrating) || null, Number(p.peakrating) || null, p.photourl || null, p.location || null]
   );
   return upsertResult.rows[0];
 }
@@ -544,4 +560,5 @@ app.get('/monster-puzzle/:id', async (req, res) => {
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+await ensureSchema();
 app.listen(PORT, () => console.log(`cross-tables-api listening on :${PORT}`));
