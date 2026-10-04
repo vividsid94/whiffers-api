@@ -481,6 +481,49 @@ app.get('/players/rankings', async (req, res) => {
   }
 });
 
+// One-time backfill for players cached before the `location` column
+// existed - fetchAndCachePlayer only ever refreshes ONE player's row (the
+// one just viewed on their profile page), and /players/rankings never
+// writes anything at all, so without this, most of the ~978 existing rows
+// would just sit at location=NULL indefinitely, only filling in one at a
+// time as people happen to get looked up individually. This walks every
+// row missing a location and re-fetches just that field from cross-tables.
+//
+// Password-gated (same UPLOAD_PASSWORD temp-password convention /registry
+// uses) since this is an admin action, not something any visitor should be
+// able to trigger - a few hundred outbound calls to cross-tables on demand.
+// Responds immediately and does the actual work after responding (plain
+// fire-and-forget, not a job queue - this runs once, ever, by hand) so the
+// request doesn't sit open for the minutes the full pass takes; progress
+// goes to this service's own console log. 200ms between calls is just being
+// a reasonable guest of cross-tables' free API, not a documented rate limit.
+app.post('/admin/backfill-locations', async (req, res) => {
+  const { password } = req.body || {};
+  if (!checkUploadPassword(password)) {
+    return res.status(401).json({ error: 'incorrect password' });
+  }
+
+  const { rows } = await pool.query('SELECT playerid FROM players WHERE location IS NULL');
+  res.json({ status: 'started', playersToCheck: rows.length });
+
+  let updated = 0;
+  let failed = 0;
+  for (const { playerid } of rows) {
+    try {
+      const { player: p } = await fetchJson(`${CROSSTABLES_API}/player.php?player=${playerid}`);
+      if (p?.location) {
+        await pool.query('UPDATE players SET location=$1, updated_at=now() WHERE playerid=$2', [p.location, playerid]);
+        updated++;
+      }
+    } catch (err) {
+      failed++;
+      console.error(`backfill-locations: player ${playerid} failed:`, err.message);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  console.log(`backfill-locations done: ${updated} updated, ${failed} failed, out of ${rows.length} checked`);
+});
+
 // --- Monster Puzzle -------------------------------------------------------
 // Precomputed puzzle positions - whiffers/scripts/generateMonsterPuzzles.mjs
 // writes rows directly into this table (see that script's own header for
