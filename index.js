@@ -469,7 +469,7 @@ app.get('/players/rankings', async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 2000, 5000);
   try {
     const { rows } = await pool.query(
-      `SELECT playerid, name, currrating, twlrating, cswrating, photourl
+      `SELECT playerid, name, currrating, twlrating, cswrating, photourl, location
        FROM players WHERE twlrating IS NOT NULL OR cswrating IS NOT NULL
        ORDER BY twlrating DESC NULLS LAST LIMIT $1`,
       [limit]
