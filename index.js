@@ -990,7 +990,18 @@ async function computeGameEquity(playerid, annotatedid, opponentName) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             board: buildBoardForRequest(entry.beforeBoard, blanksBeforeThisEntry),
-            rack: entry.rack, topN: 1000, poolSize: unseen.length, lexicon: resolvedLexicon,
+            // 300, not 1000 - the earlier value was a real, avoidable cost
+            // driver (the move generator's own response payload scales with
+            // topN, and at full-queue scale this showed up as $14+ of
+            // Railway egress in one day). "best" only ever needs
+            // candidates[0], safe at any topN - the real risk this value
+            // trades off is an unusually BAD actual play ranking outside
+            // the top 300 and getting skipped ('not-found-in-candidates')
+            // instead of scored, since a bad play can rank anywhere in the
+            // full list, not just near the top. 300 is a deliberate
+            // judgment call, not a proven-safe number - revisit if skip
+            // rates for this reason climb in a future run.
+            rack: entry.rack, topN: 300, poolSize: unseen.length, lexicon: resolvedLexicon,
           }),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
