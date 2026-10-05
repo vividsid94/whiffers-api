@@ -888,7 +888,13 @@ async function computeGameEquity(playerid, annotatedid, opponentName) {
     }
     if (!ourUsername) return { tag: 'skipped-name-mismatch', turnsAnalyzed: 0, turnsSkipped: 0 };
 
-    const { lexicon: resolvedLexicon } = resolveAnalysisLexicon(gcgLexicon);
+    // Same fallback chain Viewer.jsx itself already uses (parsed.lexicon ||
+    // game.lexicon) - a lot of real GCGs carry no #lexicon header line at
+    // all (confirmed directly on this exact game), so the GCG text's own
+    // tag alone isn't reliable; annotated.php's separate top-level lexicon
+    // field (already stored on this same `game` row) is the real fallback,
+    // not just "give up and approximate to NWL23."
+    const { lexicon: resolvedLexicon } = resolveAnalysisLexicon(gcgLexicon || game.lexicon);
 
     const turns = [];
     let totalEquityLoss = 0;
