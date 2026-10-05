@@ -612,17 +612,27 @@ function freshBoard() {
 function cloneBoard(board) {
   return board.map((row) => [...row]);
 }
+// NOTE: this diverges from gcgParser.js's own parseHeader in one way -
+// that function only keeps the full display name and discards the short
+// username token (\S+) that precedes it, since whiffers' own moveHistory
+// already re-labels every entry with the display name (see
+// parseGCGToMoveHistory below, which does the same here). But a GCG move
+// line itself (">username: ...") is keyed by that SHORT username, not the
+// display name - computeGameEquity needs the username to know which
+// entries are its own turns, so both are captured here.
 function parseGcgHeader(lines) {
   let player1Name = null;
   let player2Name = null;
+  let player1Username = null;
+  let player2Username = null;
   let lexicon = null;
   for (const line of lines) {
     let m;
-    if ((m = line.match(/^#player1\s+\S+\s+(.+)$/))) player1Name = m[1].trim();
-    else if ((m = line.match(/^#player2\s+\S+\s+(.+)$/))) player2Name = m[1].trim();
+    if ((m = line.match(/^#player1\s+(\S+)\s+(.+)$/))) { player1Username = m[1]; player1Name = m[2].trim(); }
+    else if ((m = line.match(/^#player2\s+(\S+)\s+(.+)$/))) { player2Username = m[1]; player2Name = m[2].trim(); }
     else if ((m = line.match(/^#lexicon\s+(\S+)/))) lexicon = m[1];
   }
-  return { player1Name, player2Name, lexicon };
+  return { player1Name, player2Name, player1Username, player2Username, lexicon };
 }
 function decodePosition(field) {
   let m = field.match(/^(\d+)([A-O])$/);
@@ -669,11 +679,15 @@ function parseMoveLine(line) {
   return parsed ? { ...parsed, player: m[1] } : null;
 }
 
-// Returns { moveHistory, blankTiles, player1Name, player2Name, lexicon } -
-// see gcgParser.js's own JSDoc for the exact moveHistory entry shape.
+// Returns { moveHistory, blankTiles, player1Name, player2Name,
+// player1Username, player2Username, lexicon } - see gcgParser.js's own
+// JSDoc for the exact moveHistory entry shape (note: every entry's own
+// `player` field is the short USERNAME, same as a raw GCG move line's own
+// ">username:" token - the two added Username fields here are what let a
+// caller map that back to a display name/identity).
 function parseGCGToMoveHistory(gcgText) {
   const lines = (gcgText || '').replace(/\r\n?/g, '\n').split('\n');
-  const { player1Name, player2Name, lexicon } = parseGcgHeader(lines);
+  const { player1Name, player2Name, player1Username, player2Username, lexicon } = parseGcgHeader(lines);
 
   let board = freshBoard();
   const blankTiles = [];
@@ -745,7 +759,7 @@ function parseGCGToMoveHistory(gcgText) {
     });
   }
 
-  return { moveHistory, blankTiles, player1Name, player2Name, lexicon };
+  return { moveHistory, blankTiles, player1Name, player2Name, player1Username, player2Username, lexicon };
 }
 
 // Copied from whiffers/src/functions/play/moveHistoryFunctions.js.
@@ -841,19 +855,25 @@ async function computeGameEquity(playerid, annotatedid, opponentName) {
     }
     if (!game || !game.gcg_text) return { tag: 'error', turnsAnalyzed: 0, turnsSkipped: 0 };
 
-    const { moveHistory, blankTiles, player1Name, player2Name, lexicon: gcgLexicon } = parseGCGToMoveHistory(game.gcg_text);
+    const {
+      moveHistory, blankTiles, player1Name, player2Name,
+      player1Username, player2Username, lexicon: gcgLexicon,
+    } = parseGCGToMoveHistory(game.gcg_text);
 
-    // Which GCG header name is "us," by elimination against the opponent
-    // name allanno.csv already told us - a GCG carries no playerid at all,
-    // only display names. If neither or both names line up with the known
+    // Which GCG header side is "us," by elimination against the opponent
+    // display name allanno.csv already told us - a GCG carries no playerid
+    // at all, only names. If neither or both names line up with the known
     // opponent, the data doesn't agree with itself - skip rather than guess.
+    // Every moveHistory entry's own `player` field is the short USERNAME
+    // (the ">username:" token), not the display name - ourUsername, not
+    // ourName, is what the per-turn ownership filter below needs.
     const norm = (s) => (s || '').trim().toLowerCase();
     const p1IsOpponent = norm(player1Name) === norm(opponentName);
     const p2IsOpponent = norm(player2Name) === norm(opponentName);
-    let ourName = null;
-    if (p1IsOpponent && !p2IsOpponent) ourName = player2Name;
-    else if (p2IsOpponent && !p1IsOpponent) ourName = player1Name;
-    if (!ourName) return { tag: 'skipped-name-mismatch', turnsAnalyzed: 0, turnsSkipped: 0 };
+    let ourUsername = null;
+    if (p1IsOpponent && !p2IsOpponent) ourUsername = player2Username;
+    else if (p2IsOpponent && !p1IsOpponent) ourUsername = player1Username;
+    if (!ourUsername) return { tag: 'skipped-name-mismatch', turnsAnalyzed: 0, turnsSkipped: 0 };
 
     const { lexicon: resolvedLexicon } = resolveAnalysisLexicon(gcgLexicon);
 
@@ -872,7 +892,7 @@ async function computeGameEquity(playerid, annotatedid, opponentName) {
         (b) => typeof entry.beforeBoard[b.row]?.[b.col] === 'string',
       );
 
-      if (entry.player !== ourName) continue;
+      if (entry.player !== ourUsername) continue;
       if (NON_DECISION_WORDS.has(entry.word)) continue;
 
       const unseen = computeRetroactivePool(entry.beforeBoard, blanksBeforeThisEntry, entry.rack);
@@ -971,12 +991,22 @@ const equityJob = {
 const EQUITY_JOB_CONCURRENCY = 7;
 
 app.post('/admin/equity-loss/start', async (req, res) => {
-  const { password } = req.body || {};
+  const { password, reset } = req.body || {};
   if (!checkUploadPassword(password)) {
     return res.status(401).json({ error: 'incorrect password' });
   }
   if (equityJob.running) {
     return res.status(409).json({ error: 'already running', ...equityJob });
+  }
+
+  // reset: true wipes every existing game_equity row first - for recomputing
+  // everything from scratch after a fix to computeGameEquity itself (the
+  // normal skip-already-done resumability is specifically wrong in that
+  // case, since "already done" rows may hold results from the OLD, buggy
+  // logic). Not exposed as a separate endpoint - this is still the same
+  // password-gated admin action, just with an extra explicit flag.
+  if (reset === true) {
+    await pool.query('DELETE FROM game_equity');
   }
 
   // Fresh queue every /start - highest-rated player first (GREATEST ignores
