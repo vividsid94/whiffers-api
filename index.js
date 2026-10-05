@@ -956,6 +956,20 @@ async function computeGameEquity(playerid, annotatedid, opponentName) {
           }));
           const sig = placedTilesSignature(placed);
           matched = candidates.find((c) => !c.isExchange && placedTilesSignature((c.tiles || []).filter((t) => t.isNew)) === sig);
+          // An opening move played through the exact center square on an
+          // empty board has a true mirror-image twin (same word, same
+          // score, transposed row/col) - confirmed directly against the
+          // live service that it only returns ONE of the two (a sensible
+          // dedup on a position that's genuinely symmetric, not a bug
+          // there). If the real play happened to use the orientation that
+          // got deduped away, retry against the transposed signature
+          // before giving up - this can only ever matter for a game's
+          // very first move, since the board stops being symmetric the
+          // instant a second tile lands anywhere else.
+          if (!matched) {
+            const transposedSig = placedTilesSignature(placed.map((t) => ({ ...t, row: t.col, col: t.row })));
+            matched = candidates.find((c) => !c.isExchange && placedTilesSignature((c.tiles || []).filter((t) => t.isNew)) === transposedSig);
+          }
         }
 
         if (!matched) {
