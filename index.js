@@ -196,7 +196,14 @@ async function fetchAndCacheGame(annotatedid) {
      RETURNING *`,
     [annotatedid, raw.lexicon || null, gcg_text, raw.source || null, raw.round || null]
   );
-  return upsertResult.rows[0];
+  // player1id/player2id tacked onto the return value only - never written
+  // to the DB row itself (still NULL there, see this function's own header
+  // comment on why). computeGameEquity (equity-loss section) needs these
+  // as a reliable, numeric way to tell which GCG side is "us" - the GCG's
+  // own header names are NOT reliable for that (confirmed directly: real
+  // games exist where the header is just "Kevin"/"Josh", nothing close to
+  // either player's actual full display name).
+  return { ...upsertResult.rows[0], player1id: Number(raw.player1id) || null, player2id: Number(raw.player2id) || null };
 }
 
 // GET /game/:annotatedid - a single game's raw GCG content (DB-first, live-
@@ -842,17 +849,21 @@ function exchangeLetterSignature(letters) {
 }
 
 // Computes and upserts one (playerid, annotatedid) pair's equity-loss row.
-// Returns a short result tag for the caller's own run counters -
-// 'scored' | 'skipped-name-mismatch' | 'error'. Never throws - every
-// failure mode is caught and reported back as a tag instead, so one bad
-// game can't take down the whole batch loop.
+// Returns { tag, turnsAnalyzed, turnsSkipped } for the caller's own run
+// counters - tag is 'scored' | 'skipped-name-mismatch' | 'error'. Never
+// throws - every failure mode is caught and reported back as a tag
+// instead, so one bad game can't take down the whole batch loop.
 async function computeGameEquity(playerid, annotatedid, opponentName) {
   try {
-    let { rows } = await pool.query('SELECT * FROM annotated_games WHERE annotatedid = $1', [annotatedid]);
-    let game = rows[0];
-    if (!game || !game.gcg_text) {
-      game = await fetchAndCacheGame(annotatedid);
-    }
+    // Always a fresh fetch (not the DB-cache-first pattern /game/:annotatedid
+    // uses) specifically to get player1id/player2id - annotated.php's own
+    // response carries these as real cross-tables ids, which is a far more
+    // reliable way to tell "which GCG side is us" than matching display
+    // names (confirmed directly: real GCGs exist whose header is just
+    // "Kevin"/"Josh", nothing close to either player's actual full name).
+    // gcg_text itself still gets cached by this same call as always - only
+    // the "skip re-fetching if already cached" optimization is skipped here.
+    const game = await fetchAndCacheGame(annotatedid);
     if (!game || !game.gcg_text) return { tag: 'error', turnsAnalyzed: 0, turnsSkipped: 0 };
 
     const {
@@ -860,19 +871,21 @@ async function computeGameEquity(playerid, annotatedid, opponentName) {
       player1Username, player2Username, lexicon: gcgLexicon,
     } = parseGCGToMoveHistory(game.gcg_text);
 
-    // Which GCG header side is "us," by elimination against the opponent
-    // display name allanno.csv already told us - a GCG carries no playerid
-    // at all, only names. If neither or both names line up with the known
-    // opponent, the data doesn't agree with itself - skip rather than guess.
-    // Every moveHistory entry's own `player` field is the short USERNAME
-    // (the ">username:" token), not the display name - ourUsername, not
-    // ourName, is what the per-turn ownership filter below needs.
-    const norm = (s) => (s || '').trim().toLowerCase();
-    const p1IsOpponent = norm(player1Name) === norm(opponentName);
-    const p2IsOpponent = norm(player2Name) === norm(opponentName);
     let ourUsername = null;
-    if (p1IsOpponent && !p2IsOpponent) ourUsername = player2Username;
-    else if (p2IsOpponent && !p1IsOpponent) ourUsername = player1Username;
+    if (game.player1id === playerid && game.player2id !== playerid) ourUsername = player1Username;
+    else if (game.player2id === playerid && game.player1id !== playerid) ourUsername = player2Username;
+
+    // Fallback only for the rare case cross-tables' own response didn't
+    // carry a usable player1id/player2id (e.g. an anonymous/unlinked
+    // opponent) - the same display-name elimination as before, strictly
+    // worse than the id check above but better than nothing.
+    if (!ourUsername) {
+      const norm = (s) => (s || '').trim().toLowerCase();
+      const p1IsOpponent = norm(player1Name) === norm(opponentName);
+      const p2IsOpponent = norm(player2Name) === norm(opponentName);
+      if (p1IsOpponent && !p2IsOpponent) ourUsername = player2Username;
+      else if (p2IsOpponent && !p1IsOpponent) ourUsername = player1Username;
+    }
     if (!ourUsername) return { tag: 'skipped-name-mismatch', turnsAnalyzed: 0, turnsSkipped: 0 };
 
     const { lexicon: resolvedLexicon } = resolveAnalysisLexicon(gcgLexicon);
