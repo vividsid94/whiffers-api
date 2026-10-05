@@ -848,6 +848,16 @@ function exchangeLetterSignature(letters) {
   return [...letters].sort().join('');
 }
 
+// True only when every cell is still a plain premium-square number (no
+// letter string placed anywhere yet) - the one condition under which
+// board[r][c]===board[c][r] everywhere is actually guaranteed (both the
+// board contents and the standard premium-square layout are themselves
+// transposition-symmetric), making a transposed-signature match provably
+// valid rather than merely "hasn't coincidentally mismatched in testing."
+function isBoardEmpty(board) {
+  return board.every((row) => row.every((cell) => typeof cell !== 'string'));
+}
+
 // Computes and upserts one (playerid, annotatedid) pair's equity-loss row.
 // Returns { tag, turnsAnalyzed, turnsSkipped } for the caller's own run
 // counters - tag is 'scored' | 'skipped-name-mismatch' | 'error'. Never
@@ -957,22 +967,29 @@ async function computeGameEquity(playerid, annotatedid, opponentName) {
           }));
           const sig = placedTilesSignature(placed);
           matched = candidates.find((c) => !c.isExchange && placedTilesSignature((c.tiles || []).filter((t) => t.isNew)) === sig);
-          // An opening move played through the exact center square on an
-          // empty board has a true mirror-image twin (same word, same
-          // score, transposed row/col) - confirmed directly against the
-          // live service that it only returns ONE of the two (a sensible
-          // dedup on a position that's genuinely symmetric, not a bug
-          // there). If the real play happened to use the orientation that
-          // got deduped away, retry against the transposed signature
-          // before giving up. This can only ever find a match on a board
-          // that's itself transposition-symmetric (board[r][c]===board[c][r]
-          // everywhere) - true of the empty board (the premium-square
-          // layout is itself symmetric that way) and essentially never
+          // A move played through the exact center square on a still-
+          // completely-empty board has a true mirror-image twin (same
+          // word, same score, transposed row/col) - confirmed directly
+          // against the live service that it only returns ONE of the two
+          // (a sensible dedup on a position that's genuinely symmetric,
+          // not a bug there). If the real play happened to use the
+          // orientation that got deduped away, retry against the
+          // transposed signature before giving up. This can only ever
+          // find a match when board[r][c]===board[c][r] everywhere, true
+          // of a genuinely empty board regardless of how many leading
+          // passes/exchanges (by either player) came before it - NOT
+          // specifically "this player's own first turn" (confirmed
+          // directly: real games exist where both players exchange once
+          // or twice before anyone places a tile) - and essentially never
           // true again the instant one real tile lands off-diagonal.
-          // matchedViaTranspose is recorded on the turn purely so that
-          // claim is checkable against real data (it should only ever
-          // appear at turnIndex 0), not asserted on reasoning alone.
-          if (!matched) {
+          // matchedViaTranspose is recorded on the turn so this claim
+          // stays checkable against real data rather than asserted once
+          // and trusted forever. Gated on isBoardEmpty rather than just
+          // "try it and see if something matches" - makes this provably
+          // scoped to the one position it's actually valid for, instead
+          // of relying on a later, non-empty board never coincidentally
+          // producing a spurious transposed match.
+          if (!matched && isBoardEmpty(entry.beforeBoard)) {
             const transposedSig = placedTilesSignature(placed.map((t) => ({ ...t, row: t.col, col: t.row })));
             matched = candidates.find((c) => !c.isExchange && placedTilesSignature((c.tiles || []).filter((t) => t.isNew)) === transposedSig);
             if (matched) matchedViaTranspose = true;
