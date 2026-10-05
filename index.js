@@ -947,6 +947,7 @@ async function computeGameEquity(playerid, annotatedid, opponentName) {
         const best = candidates[0];
 
         let matched;
+        let matchedViaTranspose = false;
         if (isExchangeEntry) {
           const sig = exchangeLetterSignature(entry.tilesExchanged);
           matched = candidates.find((c) => c.isExchange && exchangeLetterSignature(c.word.replace(/^Exchange\s*/, '')) === sig);
@@ -963,12 +964,18 @@ async function computeGameEquity(playerid, annotatedid, opponentName) {
           // dedup on a position that's genuinely symmetric, not a bug
           // there). If the real play happened to use the orientation that
           // got deduped away, retry against the transposed signature
-          // before giving up - this can only ever matter for a game's
-          // very first move, since the board stops being symmetric the
-          // instant a second tile lands anywhere else.
+          // before giving up. This can only ever find a match on a board
+          // that's itself transposition-symmetric (board[r][c]===board[c][r]
+          // everywhere) - true of the empty board (the premium-square
+          // layout is itself symmetric that way) and essentially never
+          // true again the instant one real tile lands off-diagonal.
+          // matchedViaTranspose is recorded on the turn purely so that
+          // claim is checkable against real data (it should only ever
+          // appear at turnIndex 0), not asserted on reasoning alone.
           if (!matched) {
             const transposedSig = placedTilesSignature(placed.map((t) => ({ ...t, row: t.col, col: t.row })));
             matched = candidates.find((c) => !c.isExchange && placedTilesSignature((c.tiles || []).filter((t) => t.isNew)) === transposedSig);
+            if (matched) matchedViaTranspose = true;
           }
         }
 
@@ -985,6 +992,7 @@ async function computeGameEquity(playerid, annotatedid, opponentName) {
           turnIndex: turns.length, type: turnType,
           word: entry.word, score: entry.score, actualEquity: matched.totalValue,
           bestWord: best.word, bestEquity: best.totalValue, equityLoss,
+          ...(matchedViaTranspose ? { matchedViaTranspose: true } : {}),
         });
       } catch (err) {
         turns.push({ turnIndex: turns.length, type: turnType, word: entry.word, score: entry.score, skipped: true, reason: err.message });
