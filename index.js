@@ -911,7 +911,8 @@ async function computeGameEquity(playerid, annotatedid, opponentName) {
     let turnsAnalyzed = 0;
     let turnsSkipped = 0;
 
-    for (const entry of moveHistory) {
+    for (let i = 0; i < moveHistory.length; i++) {
+      const entry = moveHistory[i];
       // blankTiles (from the parse) is the FULL list of every blank this
       // game ever places, at fixed, never-reused board cells - filtering it
       // down to ones already sitting on THIS entry's own beforeBoard is
@@ -926,6 +927,48 @@ async function computeGameEquity(playerid, annotatedid, opponentName) {
 
       const unseen = computeRetroactivePool(entry.beforeBoard, blanksBeforeThisEntry, entry.rack);
       if (unseen.length <= 14) break; // pre-endgame cutoff reached - stop this game entirely
+
+      // A successfully-challenged play is immediately followed, same
+      // player, by its own 'Lost challenge' reversal entry (gcgParser's own
+      // doc comment: "the original play stays in moveHistory untouched,
+      // and the reversal becomes its OWN explicit step" - two straight
+      // lines, same player). The reversal itself is already excluded via
+      // NON_DECISION_WORDS above, but the ORIGINAL attempted play was never
+      // actually valid - scoring it as a real decision would grade a word
+      // that got taken back off the board for nothing.
+      const nextEntry = moveHistory[i + 1];
+      if (nextEntry && nextEntry.word === 'Lost challenge' && nextEntry.player === entry.player) {
+        turns.push({ turnIndex: turns.length, type: 'play', word: entry.word, score: entry.score, skipped: true, reason: 'challenged-off' });
+        turnsSkipped++;
+        continue;
+      }
+
+      // Most cross-tables games are annotated from only ONE player's point
+      // of view - that annotator reliably knows their OWN rack every turn,
+      // but can only reconstruct the OPPONENT's rack from what they visibly
+      // played, which silently drops any real leave (confirmed directly: a
+      // recorded rack of exactly "ABT" for a play of BAT isn't really
+      // their whole hand, it's just the tiles we happened to see). A real
+      // 7-tile bingo is naturally exempt from this check entirely (its own
+      // rack.length is already 7, never <7) - the exemption that matters
+      // falls out for free, no separate bingo case needed here.
+      //
+      // Genuine late-game shrinkage is different and real (the bag ran
+      // low), and is told apart using the BOARD's own tile count - always
+      // directly observable regardless of annotation side, unlike the very
+      // rack figure under suspicion: if (100 - tiles already on the board)
+      // is still >= 14, there's physically enough rack+bag room left for
+      // both players to be holding a full 7, so a short recorded rack at
+      // that point isn't genuine depletion.
+      if (entry.rack.length < 7) {
+        const boardTileCount = entry.beforeBoard.flat().filter((c) => typeof c === 'string').length;
+        const plausibleEndgame = (100 - boardTileCount) < 14;
+        if (!plausibleEndgame) {
+          turns.push({ turnIndex: turns.length, type: 'play', word: entry.word, score: entry.score, skipped: true, reason: 'partial-rack-unverified' });
+          turnsSkipped++;
+          continue;
+        }
+      }
 
       if (entry.word === 'Pass') {
         turns.push({ turnIndex: turns.length, type: 'pass', skipped: true });
