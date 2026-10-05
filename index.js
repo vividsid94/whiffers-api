@@ -52,6 +52,24 @@ async function ensureSchema() {
   } catch (err) {
     console.error('Schema check failed (location column):', err.message);
   }
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS game_equity (
+        playerid          INTEGER NOT NULL,
+        annotatedid       INTEGER NOT NULL,
+        total_equity_loss REAL NOT NULL,
+        turns_analyzed    INTEGER NOT NULL,
+        turns_skipped     INTEGER NOT NULL DEFAULT 0,
+        turns             JSONB NOT NULL,
+        lexicon_used      TEXT,
+        computed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (playerid, annotatedid)
+      );
+      CREATE INDEX IF NOT EXISTS idx_game_equity_playerid ON game_equity(playerid);
+    `);
+  } catch (err) {
+    console.error('Schema check failed (game_equity table):', err.message);
+  }
 }
 
 // Log-and-continue rather than let an unhandled rejection silently kill the
@@ -437,6 +455,26 @@ app.get('/player/:id', async (req, res) => {
       .slice()
       .sort((a, b) => (b.tourneydate || '').localeCompare(a.tourneydate || ''));
 
+    // Equity-loss results (see "--- Equity Loss ---" below) - a left join
+    // in JS rather than SQL since `games` itself comes from the in-memory
+    // allanno.csv index, not a table. Games not yet computed just keep
+    // these fields null/undefined - PlayerProfile.jsx treats that as "no
+    // dropdown to show" rather than a loading/error state.
+    const { rows: equityRows } = await pool.query(
+      'SELECT annotatedid, total_equity_loss, turns_analyzed, turns_skipped, turns FROM game_equity WHERE playerid = $1',
+      [playerid],
+    );
+    const equityByGame = new Map(equityRows.map((r) => [r.annotatedid, r]));
+    for (const g of games) {
+      const e = equityByGame.get(g.annotatedid);
+      if (e) {
+        g.equityLoss = e.total_equity_loss;
+        g.turnsAnalyzed = e.turns_analyzed;
+        g.turnsSkipped = e.turns_skipped;
+        g.turns = e.turns;
+      }
+    }
+
     res.json({ player, games });
   } catch (err) {
     console.error(err);
@@ -469,9 +507,15 @@ app.get('/players/rankings', async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 2000, 5000);
   try {
     const { rows } = await pool.query(
-      `SELECT playerid, name, currrating, twlrating, cswrating, photourl, location
-       FROM players WHERE twlrating IS NOT NULL OR cswrating IS NOT NULL
-       ORDER BY twlrating DESC NULLS LAST LIMIT $1`,
+      `SELECT p.playerid, p.name, p.currrating, p.twlrating, p.cswrating, p.photourl, p.location,
+              ge.avg_equity_loss AS "avgEquityLoss", ge.games_analyzed AS "gamesAnalyzed"
+       FROM players p
+       LEFT JOIN (
+         SELECT playerid, AVG(total_equity_loss) AS avg_equity_loss, COUNT(*) AS games_analyzed
+         FROM game_equity GROUP BY playerid
+       ) ge ON ge.playerid = p.playerid
+       WHERE p.twlrating IS NOT NULL OR p.cswrating IS NOT NULL
+       ORDER BY p.twlrating DESC NULLS LAST LIMIT $1`,
       [limit]
     );
     res.json({ results: rows });
@@ -522,6 +566,489 @@ app.post('/admin/backfill-locations', async (req, res) => {
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
   console.log(`backfill-locations done: ${updated} updated, ${failed} failed, out of ${rows.length} checked`);
+});
+
+// --- Equity Loss ------------------------------------------------------------
+// Per-player, per-game aggregate: how much equity (score + leave value) a
+// player's actual plays left on the table versus the move generator's own
+// best answer for that exact position, from turn 1 until the position
+// reaches 14 unseen tiles from their own point of view (bag + opponent's
+// rack combined) - the standard pre-endgame cutoff. See
+// whiffers/src/pages/Players.jsx and PlayerProfile.jsx for where this
+// surfaces, and the plan this was built from for the full design.
+//
+// Every helper below is a verbatim-with-attribution copy of an existing,
+// already-proven pure function living in the whiffers frontend repo - same
+// cross-repo duplication precedent decodeGamehistory above already
+// established (no shared package; these are small and rarely change).
+
+// Copied from whiffers/src/data/staticData.js.
+const letterLookup = { A: 1, B: 2, C: 3, D: 4, E: 5, F: 6, G: 7, H: 8, I: 9, J: 10, K: 11, L: 12, M: 13, N: 14, O: 15 };
+const origPool = 'AAAAAAAAABBCCDDDDEEEEEEEEEEEEFFGGGHHIIIIIIIIIJKLLLLMMNNNNNNOOOOOOOOPPQRRRRRRSSSSTTTTTTUUUUVVWWXYYZ??';
+const origBoard = `[    [4,0,0,1,0,0,0,4,0,0,0,1,0,0,4],
+    [0,3,0,0,0,2,0,0,0,2,0,0,0,3,0],
+    [0,0,3,0,0,0,1,0,1,0,0,0,3,0,0],
+    [1,0,0,3,0,0,0,1,0,0,0,3,0,0,1],
+    [0,0,0,0,3,0,0,0,0,0,3,0,0,0,0],
+    [0,2,0,0,0,2,0,0,0,2,0,0,0,2,0],
+    [0,0,1,0,0,0,1,0,1,0,0,0,1,0,0],
+    [4,0,0,1,0,0,0,5,0,0,0,1,0,0,4],
+    [0,0,1,0,0,0,1,0,1,0,0,0,1,0,0],
+    [0,2,0,0,0,2,0,0,0,2,0,0,0,2,0],
+    [0,0,0,0,3,0,0,0,0,0,3,0,0,0,0],
+    [1,0,0,3,0,0,0,1,0,0,0,3,0,0,1],
+    [0,0,3,0,0,0,1,0,1,0,0,0,3,0,0],
+    [0,3,0,0,0,2,0,0,0,2,0,0,0,3,0],
+    [4,0,0,1,0,0,0,4,0,0,0,1,0,0,4]]`;
+
+// Copied from whiffers/src/functions/gcgParser.js's own parseGCGToMoveHistory
+// and its private helpers - see that file for the full rationale on every
+// format quirk handled below (verified directly against real cross-tables
+// games, not guessed). Only the imports changed (origBoard/letterLookup are
+// module-level consts here instead of a staticData.js import).
+function freshBoard() {
+  return JSON.parse(origBoard).map((row) => row.map(Number));
+}
+function cloneBoard(board) {
+  return board.map((row) => [...row]);
+}
+function parseGcgHeader(lines) {
+  let player1Name = null;
+  let player2Name = null;
+  let lexicon = null;
+  for (const line of lines) {
+    let m;
+    if ((m = line.match(/^#player1\s+\S+\s+(.+)$/))) player1Name = m[1].trim();
+    else if ((m = line.match(/^#player2\s+\S+\s+(.+)$/))) player2Name = m[1].trim();
+    else if ((m = line.match(/^#lexicon\s+(\S+)/))) lexicon = m[1];
+  }
+  return { player1Name, player2Name, lexicon };
+}
+function decodePosition(field) {
+  let m = field.match(/^(\d+)([A-O])$/);
+  if (m) return { row: Number(m[1]) - 1, col: letterLookup[m[2]] - 1, isHorizontal: true };
+  m = field.match(/^([A-O])(\d+)$/);
+  if (m) return { row: Number(m[2]) - 1, col: letterLookup[m[1]] - 1, isHorizontal: false };
+  return null;
+}
+function parseLeadingInt(token) {
+  const m = (token || '').match(/^\+?(\d+)/);
+  return m ? Number(m[1]) : NaN;
+}
+function classifyAndParseTokens(rest) {
+  const trimmed = rest.trim();
+  if (trimmed.includes('(')) {
+    const m = trimmed.match(/^(\S*)\s*\(([^)]*)\)\s*\+?(-?\d+)\s+(\d+)/);
+    if (m) {
+      return { type: 'endgameBonus', rack: m[1], tiles: m[2], score: Number(m[3]), total: Number(m[4]) };
+    }
+  }
+  const tokens = trimmed.split(/\s+/);
+  const rack = tokens[0];
+  const second = tokens[1] || '';
+  if (second === '--') {
+    return { type: 'challenge', rack };
+  }
+  if (second.startsWith('-')) {
+    const tiles = second.slice(1);
+    const score = parseLeadingInt(tokens[2]);
+    const total = parseLeadingInt(tokens[3]);
+    return tiles === ''
+      ? { type: 'pass', rack, score, total }
+      : { type: 'exchange', rack, tilesExchanged: tiles, score, total };
+  }
+  return {
+    type: 'play', rack, position: second, word: tokens[2],
+    score: parseLeadingInt(tokens[3]), total: parseLeadingInt(tokens[4]),
+  };
+}
+function parseMoveLine(line) {
+  const m = line.match(/^>(\S+):\s*(.*)$/);
+  if (!m) return null;
+  const parsed = classifyAndParseTokens(m[2]);
+  return parsed ? { ...parsed, player: m[1] } : null;
+}
+
+// Returns { moveHistory, blankTiles, player1Name, player2Name, lexicon } -
+// see gcgParser.js's own JSDoc for the exact moveHistory entry shape.
+function parseGCGToMoveHistory(gcgText) {
+  const lines = (gcgText || '').replace(/\r\n?/g, '\n').split('\n');
+  const { player1Name, player2Name, lexicon } = parseGcgHeader(lines);
+
+  let board = freshBoard();
+  const blankTiles = [];
+  const moveHistory = [];
+
+  for (const line of lines) {
+    if (line.startsWith('#note') || !line.startsWith('>')) continue;
+    const parsed = parseMoveLine(line);
+    if (!parsed) continue;
+
+    if (parsed.type === 'pass') {
+      moveHistory.push({
+        beforeBoard: cloneBoard(board), afterBoard: cloneBoard(board),
+        player: parsed.player, score: 0, rack: parsed.rack, total: parsed.total, word: 'Pass',
+      });
+      continue;
+    }
+    if (parsed.type === 'exchange') {
+      moveHistory.push({
+        beforeBoard: cloneBoard(board), afterBoard: cloneBoard(board),
+        player: parsed.player, score: 0, rack: parsed.rack, total: parsed.total,
+        word: 'Exchange', tilesExchanged: parsed.tilesExchanged,
+      });
+      continue;
+    }
+    if (parsed.type === 'challenge') {
+      const last = moveHistory[moveHistory.length - 1];
+      if (last && last.player === parsed.player) {
+        board = cloneBoard(last.beforeBoard);
+        moveHistory.push({
+          beforeBoard: cloneBoard(last.afterBoard), afterBoard: cloneBoard(board),
+          player: parsed.player, score: -last.score, rack: parsed.rack,
+          total: last.total - last.score, word: 'Lost challenge',
+        });
+      }
+      continue;
+    }
+    if (parsed.type === 'endgameBonus') {
+      const wentOut = parsed.rack === '';
+      moveHistory.push({
+        beforeBoard: cloneBoard(board), afterBoard: cloneBoard(board),
+        player: parsed.player, score: parsed.score, total: parsed.total,
+        rack: parsed.rack,
+        word: wentOut ? 'Endgame bonus' : 'Rack penalty',
+        revealedOpponentRack: wentOut ? parsed.tiles : undefined,
+      });
+      continue;
+    }
+
+    const pos = decodePosition(parsed.position);
+    if (!pos) continue;
+    const beforeBoard = cloneBoard(board);
+    const afterBoard = cloneBoard(board);
+    let { row, col } = pos;
+    for (let i = 0; i < parsed.word.length; i++) {
+      const ch = parsed.word[i];
+      if (ch !== '.') {
+        const isBlank = ch >= 'a' && ch <= 'z';
+        afterBoard[row][col] = ch.toUpperCase();
+        if (isBlank) blankTiles.push({ row, col });
+      }
+      if (pos.isHorizontal) col++; else row++;
+    }
+    board = afterBoard;
+    moveHistory.push({
+      beforeBoard, afterBoard,
+      player: parsed.player, score: parsed.score, rack: parsed.rack, total: parsed.total,
+      word: parsed.word.replace(/\./g, '').toUpperCase(),
+    });
+  }
+
+  return { moveHistory, blankTiles, player1Name, player2Name, lexicon };
+}
+
+// Copied from whiffers/src/functions/play/moveHistoryFunctions.js.
+function findPlacedTiles(beforeBoard, afterBoard) {
+  if (!beforeBoard || !afterBoard) return [];
+  const placed = [];
+  for (let row = 0; row < afterBoard.length; row++) {
+    for (let col = 0; col < afterBoard[row].length; col++) {
+      const before = beforeBoard[row]?.[col];
+      const after = afterBoard[row]?.[col];
+      if (typeof after === 'string' && typeof before !== 'string') {
+        placed.push({ row, col });
+      }
+    }
+  }
+  return placed;
+}
+function placedTilesSignature(cells) {
+  return cells.map((t) => `${t.row},${t.col},${t.letter}`).sort().join('|');
+}
+
+// Copied from whiffers/src/functions/viewer/computeRetroactivePool.js - the
+// full 100-tile set minus every tile on the board minus one rack. Its
+// length is "bag + the other player's unseen hand" from whichever rack was
+// passed in - exactly the "14 unseen" cutoff quantity, with no separate
+// true-bag-count needed (same blended number Viewer's own Ask Wally already
+// sends the move generator as poolSize - see resolveAnalysisLexicon's own
+// comment for why this app treats the two as one quantity).
+function computeRetroactivePool(board, blankTiles, rack) {
+  const remaining = origPool.split('');
+  function removeOne(ch) {
+    const idx = remaining.indexOf(ch);
+    if (idx !== -1) remaining.splice(idx, 1);
+  }
+  for (let row = 0; row < board.length; row++) {
+    for (let col = 0; col < board[row].length; col++) {
+      const cell = board[row][col];
+      if (typeof cell !== 'string') continue;
+      const isBlank = blankTiles.some((b) => b.row === row && b.col === col);
+      removeOne(isBlank ? '?' : cell);
+    }
+  }
+  for (const ch of rack) removeOne(ch);
+  return remaining;
+}
+
+// Copied from whiffers/src/functions/play/botFunctions.js.
+function buildBoardForRequest(boardCoords, blankTiles) {
+  return boardCoords.map((row, r) => row.map((cell, c) => {
+    if (typeof cell !== 'string') return '';
+    const isBlank = blankTiles.some((b) => b.row === r && b.col === c);
+    return isBlank ? cell.toLowerCase() : cell;
+  }));
+}
+
+// Copied from whiffers/src/functions/viewer/resolveAnalysisLexicon.js - see
+// that file for the full rationale (exact-match against every lexicon
+// main-for-scrabble.go now loads, approximate NASPA/Collins-family fallback
+// otherwise).
+const SUPPORTED_LEXICONS = ['NWL23', 'CSW24', 'TWL06', 'TWL14', 'OTCWL2016', 'NWL18', 'NWL20', 'WOW24'];
+function resolveAnalysisLexicon(rawLexicon) {
+  const normalized = (rawLexicon || '').toUpperCase();
+  if (SUPPORTED_LEXICONS.includes(normalized)) {
+    return { lexicon: normalized, isApproximate: false };
+  }
+  const isCollinsFamily = normalized.startsWith('CSW') || normalized.startsWith('SOWPODS') || normalized.startsWith('COLLINS');
+  return { lexicon: isCollinsFamily ? 'CSW24' : 'NWL23', isApproximate: true };
+}
+
+const GO_SERVICE_URL = 'https://scrabble-move-generator-production.up.railway.app';
+
+// Word labels gcgParser.js uses for bookkeeping entries that aren't a real
+// rack decision (challenge reversal, end-of-game rack bonus/penalty) - never
+// scored, same reasoning Viewer's own drawback-evaluation code excludes them
+// for (see whiffers' evaluate.js NON_PLAY_WORDS).
+const NON_DECISION_WORDS = new Set(['Lost challenge', 'Endgame bonus', 'Rack penalty']);
+
+function exchangeLetterSignature(letters) {
+  return [...letters].sort().join('');
+}
+
+// Computes and upserts one (playerid, annotatedid) pair's equity-loss row.
+// Returns a short result tag for the caller's own run counters -
+// 'scored' | 'skipped-name-mismatch' | 'error'. Never throws - every
+// failure mode is caught and reported back as a tag instead, so one bad
+// game can't take down the whole batch loop.
+async function computeGameEquity(playerid, annotatedid, opponentName) {
+  try {
+    let { rows } = await pool.query('SELECT * FROM annotated_games WHERE annotatedid = $1', [annotatedid]);
+    let game = rows[0];
+    if (!game || !game.gcg_text) {
+      game = await fetchAndCacheGame(annotatedid);
+    }
+    if (!game || !game.gcg_text) return { tag: 'error', turnsAnalyzed: 0, turnsSkipped: 0 };
+
+    const { moveHistory, blankTiles, player1Name, player2Name, lexicon: gcgLexicon } = parseGCGToMoveHistory(game.gcg_text);
+
+    // Which GCG header name is "us," by elimination against the opponent
+    // name allanno.csv already told us - a GCG carries no playerid at all,
+    // only display names. If neither or both names line up with the known
+    // opponent, the data doesn't agree with itself - skip rather than guess.
+    const norm = (s) => (s || '').trim().toLowerCase();
+    const p1IsOpponent = norm(player1Name) === norm(opponentName);
+    const p2IsOpponent = norm(player2Name) === norm(opponentName);
+    let ourName = null;
+    if (p1IsOpponent && !p2IsOpponent) ourName = player2Name;
+    else if (p2IsOpponent && !p1IsOpponent) ourName = player1Name;
+    if (!ourName) return { tag: 'skipped-name-mismatch', turnsAnalyzed: 0, turnsSkipped: 0 };
+
+    const { lexicon: resolvedLexicon } = resolveAnalysisLexicon(gcgLexicon);
+
+    const turns = [];
+    let totalEquityLoss = 0;
+    let turnsAnalyzed = 0;
+    let turnsSkipped = 0;
+
+    for (const entry of moveHistory) {
+      // blankTiles (from the parse) is the FULL list of every blank this
+      // game ever places, at fixed, never-reused board cells - filtering it
+      // down to ones already sitting on THIS entry's own beforeBoard is
+      // exactly "blanks placed strictly before this turn," with no separate
+      // turn-by-turn bookkeeping needed.
+      const blanksBeforeThisEntry = blankTiles.filter(
+        (b) => typeof entry.beforeBoard[b.row]?.[b.col] === 'string',
+      );
+
+      if (entry.player !== ourName) continue;
+      if (NON_DECISION_WORDS.has(entry.word)) continue;
+
+      const unseen = computeRetroactivePool(entry.beforeBoard, blanksBeforeThisEntry, entry.rack);
+      if (unseen.length <= 14) break; // pre-endgame cutoff reached - stop this game entirely
+
+      if (entry.word === 'Pass') {
+        turns.push({ turnIndex: turns.length, type: 'pass', skipped: true });
+        turnsSkipped++;
+        continue;
+      }
+
+      // tilesExchanged (not word text) is the real signal an entry is an
+      // exchange - word is always the literal string 'Exchange' for one,
+      // but matching on the data field rather than display text avoids any
+      // chance of confusion with a genuine (if vanishingly unlikely) real
+      // word play that happened to spell "EXCHANGE".
+      const isExchangeEntry = entry.tilesExchanged != null;
+      const turnType = isExchangeEntry ? 'exchange' : 'play';
+
+      try {
+        const res = await fetch(`${GO_SERVICE_URL}/generate-moves`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            board: buildBoardForRequest(entry.beforeBoard, blanksBeforeThisEntry),
+            rack: entry.rack, topN: 1000, poolSize: unseen.length, lexicon: resolvedLexicon,
+          }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const candidates = data.moves || [];
+        if (candidates.length === 0) throw new Error('no candidates returned');
+        const best = candidates[0];
+
+        let matched;
+        if (isExchangeEntry) {
+          const sig = exchangeLetterSignature(entry.tilesExchanged);
+          matched = candidates.find((c) => c.isExchange && exchangeLetterSignature(c.word.replace(/^Exchange\s*/, '')) === sig);
+        } else {
+          const placed = findPlacedTiles(entry.beforeBoard, entry.afterBoard).map(({ row, col }) => ({
+            row, col, letter: entry.afterBoard[row][col],
+          }));
+          const sig = placedTilesSignature(placed);
+          matched = candidates.find((c) => !c.isExchange && placedTilesSignature((c.tiles || []).filter((t) => t.isNew)) === sig);
+        }
+
+        if (!matched) {
+          turns.push({ turnIndex: turns.length, type: turnType, word: entry.word, score: entry.score, skipped: true, reason: 'not-found-in-candidates' });
+          turnsSkipped++;
+          continue;
+        }
+
+        const equityLoss = Math.max(0, best.totalValue - matched.totalValue);
+        totalEquityLoss += equityLoss;
+        turnsAnalyzed++;
+        turns.push({
+          turnIndex: turns.length, type: turnType,
+          word: entry.word, score: entry.score, actualEquity: matched.totalValue,
+          bestWord: best.word, bestEquity: best.totalValue, equityLoss,
+        });
+      } catch (err) {
+        turns.push({ turnIndex: turns.length, type: turnType, word: entry.word, score: entry.score, skipped: true, reason: err.message });
+        turnsSkipped++;
+      }
+    }
+
+    await pool.query(
+      `INSERT INTO game_equity (playerid, annotatedid, total_equity_loss, turns_analyzed, turns_skipped, turns, lexicon_used)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (playerid, annotatedid) DO UPDATE SET
+         total_equity_loss=$3, turns_analyzed=$4, turns_skipped=$5, turns=$6, lexicon_used=$7, computed_at=now()`,
+      [playerid, annotatedid, totalEquityLoss, turnsAnalyzed, turnsSkipped, JSON.stringify(turns), resolvedLexicon],
+    );
+    return { tag: 'scored', turnsAnalyzed, turnsSkipped };
+  } catch (err) {
+    console.error(`computeGameEquity(${playerid}, ${annotatedid}) failed:`, err.message);
+    return { tag: 'error', turnsAnalyzed: 0, turnsSkipped: 0 };
+  }
+}
+
+// Job control - module-level state for the one background job this service
+// runs at a time. Deliberately in-memory, not persisted: a Railway restart
+// mid-run just stops it (nothing lost - every completed game is already
+// committed to game_equity), and /admin/equity-loss/start simply needs
+// triggering again to resume, same as after a deliberate /stop.
+const equityJob = {
+  running: false,
+  shouldStop: false,
+  startedAt: null,
+  queueRemaining: 0,
+  gamesCompletedThisRun: 0,
+  turnsScoredThisRun: 0,
+  turnsSkippedThisRun: 0,
+  gamesSkippedThisRun: 0,
+};
+const EQUITY_JOB_CONCURRENCY = 7;
+
+app.post('/admin/equity-loss/start', async (req, res) => {
+  const { password } = req.body || {};
+  if (!checkUploadPassword(password)) {
+    return res.status(401).json({ error: 'incorrect password' });
+  }
+  if (equityJob.running) {
+    return res.status(409).json({ error: 'already running', ...equityJob });
+  }
+
+  // Fresh queue every /start - highest-rated player first (GREATEST ignores
+  // NULLs, same convention /players/rankings' own WHERE clause already
+  // uses), every (playerid, annotatedid) pair that player's own games list
+  // carries, minus whatever's already in game_equity. Rebuilding from
+  // scratch each run (rather than persisting a queue) is what makes this
+  // automatically pick up newly-cached players/games with zero bookkeeping.
+  const { rows: ranked } = await pool.query(
+    `SELECT playerid FROM players
+     WHERE twlrating IS NOT NULL OR cswrating IS NOT NULL
+     ORDER BY GREATEST(twlrating, cswrating) DESC NULLS LAST`,
+  );
+  const { rows: doneRows } = await pool.query('SELECT playerid, annotatedid FROM game_equity');
+  const done = new Set(doneRows.map((r) => `${r.playerid}:${r.annotatedid}`));
+
+  const queue = [];
+  for (const { playerid } of ranked) {
+    for (const g of gamesByPlayer.get(playerid) || []) {
+      if (!g.opponentName) continue; // can't tell our name from theirs without it
+      if (done.has(`${playerid}:${g.annotatedid}`)) continue;
+      queue.push({ playerid, annotatedid: g.annotatedid, opponentName: g.opponentName });
+    }
+  }
+
+  equityJob.running = true;
+  equityJob.shouldStop = false;
+  equityJob.startedAt = new Date().toISOString();
+  equityJob.queueRemaining = queue.length;
+  equityJob.gamesCompletedThisRun = 0;
+  equityJob.turnsScoredThisRun = 0;
+  equityJob.turnsSkippedThisRun = 0;
+  equityJob.gamesSkippedThisRun = 0;
+
+  res.json({ status: 'started', queued: queue.length });
+
+  // Fire-and-forget worker pool - EQUITY_JOB_CONCURRENCY workers each pull
+  // the next queue item until it's empty or shouldStop is set. Not awaited
+  // by the response above on purpose (same pattern as /admin/backfill-locations).
+  let cursor = 0;
+  async function worker() {
+    while (cursor < queue.length && !equityJob.shouldStop) {
+      const item = queue[cursor++];
+      equityJob.queueRemaining = queue.length - cursor;
+      const result = await computeGameEquity(item.playerid, item.annotatedid, item.opponentName);
+      equityJob.turnsScoredThisRun += result.turnsAnalyzed;
+      equityJob.turnsSkippedThisRun += result.turnsSkipped;
+      if (result.tag === 'scored') {
+        equityJob.gamesCompletedThisRun++;
+      } else {
+        equityJob.gamesSkippedThisRun++;
+      }
+    }
+  }
+  const workers = Array.from({ length: EQUITY_JOB_CONCURRENCY }, () => worker());
+  Promise.all(workers).then(() => {
+    equityJob.running = false;
+    console.log(`equity-loss run finished/stopped: ${equityJob.gamesCompletedThisRun} scored, ${equityJob.gamesSkippedThisRun} skipped`);
+  });
+});
+
+app.post('/admin/equity-loss/stop', (req, res) => {
+  const { password } = req.body || {};
+  if (!checkUploadPassword(password)) {
+    return res.status(401).json({ error: 'incorrect password' });
+  }
+  equityJob.shouldStop = true;
+  res.json({ status: 'stopping', ...equityJob });
+});
+
+app.get('/admin/equity-loss/status', (req, res) => {
+  res.json(equityJob);
 });
 
 // --- Monster Puzzle -------------------------------------------------------
