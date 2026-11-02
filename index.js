@@ -5,6 +5,11 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { parse } from 'csv-parse/sync';
+import rateLimit from 'express-rate-limit';
+import { buildBoardForRequest, GO_SERVICE_URL } from './rules/boardRequest.js';
+import { createGamesRouter } from './games/routes.js';
+import { ensureGamesSchema, cleanupGames } from './games/repo.js';
+import { preloadDictionaries } from './games/dictionary.js';
 
 const PORT = process.env.PORT || 4000;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -70,6 +75,20 @@ async function ensureSchema() {
   } catch (err) {
     console.error('Schema check failed (game_equity table):', err.message);
   }
+  try {
+    await ensureGamesSchema(pool);
+  } catch (err) {
+    console.error('Schema check failed (games table):', err.message);
+  }
+}
+
+// 500s log the real error here and send the caller only a request id -
+// err.message can carry SQL or upstream details nobody outside should see
+// (SECURITY.md item 3).
+function sendInternalError(res, err) {
+  const requestId = crypto.randomUUID();
+  console.error(`[${requestId}]`, err);
+  res.status(500).json({ error: 'internal error', requestId });
 }
 
 // Log-and-continue rather than let an unhandled rejection silently kill the
@@ -112,11 +131,26 @@ for (const row of annoRows) {
 console.log(`Indexed games for ${gamesByPlayer.size} distinct players`);
 
 const app = express();
-app.use(cors());
-// Only POST /registry has a body - a 1MB cap is generous headroom for a
-// GCG transcript (plain text, real games top out well under 100KB) while
-// still bounding request size.
-app.use(express.json({ limit: '1mb' }));
+// Railway sits one proxy in front - without this every request looks like it
+// comes from the proxy and per-IP rate limits would lump all visitors together.
+app.set('trust proxy', 1);
+
+// /games has its own CORS allowlist, body limit and rate limits
+// (games/routes.js); everything else keeps the open, read-mostly setup.
+const notGames = (middleware) => (req, res, next) => (req.path.startsWith('/games') ? next() : middleware(req, res, next));
+app.use(notGames(cors()));
+// POST /registry carries a GCG transcript - a 1MB cap is generous headroom
+// (real games top out well under 100KB) while still bounding request size.
+app.use(notGames(express.json({ limit: '1mb' })));
+
+// Per-IP limits (SECURITY.md item 2): generous for the read endpoints the
+// app hits while browsing, tight for the password-gated write/admin ones.
+app.use(notGames(rateLimit({ windowMs: 15 * 60 * 1000, limit: 900, standardHeaders: 'draft-7', legacyHeaders: false })));
+const adminLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: 'draft-7', legacyHeaders: false });
+app.use('/admin', adminLimiter);
+app.post('/registry', adminLimiter);
+
+app.use('/games', createGamesRouter(pool));
 
 async function fetchJson(url) {
   const res = await fetch(url);
@@ -249,8 +283,7 @@ app.get('/game/:annotatedid', async (req, res) => {
 
     res.json({ game });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'internal error', detail: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -326,8 +359,7 @@ app.get('/game/:annotatedid/ratings', async (req, res) => {
       lexicon,
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'internal error', detail: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -390,8 +422,7 @@ app.post('/registry', async (req, res) => {
     );
     res.status(201).json({ game: rows[0] });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'internal error', detail: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -408,8 +439,7 @@ app.get('/registry', async (req, res) => {
     );
     res.json({ results: rows });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'internal error', detail: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -424,8 +454,7 @@ app.get('/registry/:id', async (req, res) => {
     if (rows.length === 0) return res.status(404).json({ error: 'game not found' });
     res.json({ game: rows[0] });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'internal error', detail: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -484,8 +513,7 @@ app.get('/player/:id', async (req, res) => {
 
     res.json({ player, games });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'internal error', detail: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -527,8 +555,7 @@ app.get('/players/rankings', async (req, res) => {
     );
     res.json({ results: rows });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'internal error', detail: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -813,15 +840,6 @@ function computeRetroactivePool(board, blankTiles, rack) {
   return remaining;
 }
 
-// Copied from whiffers/src/functions/play/botFunctions.js.
-function buildBoardForRequest(boardCoords, blankTiles) {
-  return boardCoords.map((row, r) => row.map((cell, c) => {
-    if (typeof cell !== 'string') return '';
-    const isBlank = blankTiles.some((b) => b.row === r && b.col === c);
-    return isBlank ? cell.toLowerCase() : cell;
-  }));
-}
-
 // Copied from whiffers/src/functions/viewer/resolveAnalysisLexicon.js - see
 // that file for the full rationale (exact-match against every lexicon
 // main-for-scrabble.go now loads, approximate NASPA/Collins-family fallback
@@ -835,8 +853,6 @@ function resolveAnalysisLexicon(rawLexicon) {
   const isCollinsFamily = normalized.startsWith('CSW') || normalized.startsWith('SOWPODS') || normalized.startsWith('COLLINS');
   return { lexicon: isCollinsFamily ? 'CSW24' : 'NWL23', isApproximate: true };
 }
-
-const GO_SERVICE_URL = 'https://scrabble-move-generator-production.up.railway.app';
 
 // Word labels gcgParser.js uses for bookkeeping entries that aren't a real
 // rack decision (challenge reversal, end-of-game rack bonus/penalty) - never
@@ -1249,8 +1265,7 @@ app.get('/monster-puzzle/random', async (req, res) => {
     if (rows.length === 0) return res.status(404).json({ error: 'no matching puzzle found' });
     res.json({ entry: mapMonsterPuzzleRow(rows[0]) });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'internal error', detail: err.message });
+    sendInternalError(res, err);
   }
 });
 
@@ -1265,12 +1280,19 @@ app.get('/monster-puzzle/:id', async (req, res) => {
     if (rows.length === 0) return res.status(404).json({ error: 'puzzle not found' });
     res.json({ entry: mapMonsterPuzzleRow(rows[0]) });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'internal error', detail: err.message });
+    sendInternalError(res, err);
   }
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 await ensureSchema();
+// Load both word lists now so a game's first move doesn't pay the read.
+preloadDictionaries();
+// Drop finished/abandoned games daily (one instance, so a timer is enough).
+const runGameCleanup = () => cleanupGames(pool)
+  .then((n) => { if (n) console.log(`Cleaned up ${n} old games`); })
+  .catch((err) => console.error('Game cleanup failed:', err.message));
+runGameCleanup();
+setInterval(runGameCleanup, 24 * 60 * 60 * 1000).unref();
 app.listen(PORT, () => console.log(`cross-tables-api listening on :${PORT}`));
