@@ -305,6 +305,13 @@ export function assertTileConservation(state) {
   state.racks[1].forEach(add);
   state.racks[2].forEach(add);
   state.bag.forEach(add);
+  // Drawbacks (Demotion / Unusual): tiles that changed letter, on a rack or
+  // the board, count as the letter they started as.
+  const d = state.drawbacks;
+  for (const c of [...(d?.changed?.[1] ?? []), ...(d?.changed?.[2] ?? []), ...(d?.playedChanged ?? [])]) {
+    counts[c.now] = (counts[c.now] || 0) - 1;
+    add(c.was);
+  }
   const expected = {};
   for (const t of origPool) expected[t] = (expected[t] || 0) + 1;
   const keys = new Set([...Object.keys(counts), ...Object.keys(expected)]);

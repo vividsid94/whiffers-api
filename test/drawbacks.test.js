@@ -181,3 +181,27 @@ test('drawbacks: Short-handed racks hold 6 (deal and refill); Restlessness shows
     server.close();
   }
 });
+
+test('drawbacks: Demotion drops your kept tiles after a pass and shows what they were; Unusual deals', { skip: skipGo }, async () => {
+  const { base, server } = await startServer();
+  try {
+    const DOWN = { '?': 'S' };
+    for (const c of ['EAIOU', 'ZXJKQ', 'SRNTL', 'HMDCYPBFGWV']) for (let i = 0; i + 1 < c.length; i++) DOWN[c[i]] = c[i + 1];
+    const game = await humanFirstGame(base, { player: 53, wally: 1 });
+    const before = game.state.myRack;
+    const passed = await move(base, game, game.state, 'pass', { deferBot: true });
+    assert.equal(passed.status, 200, JSON.stringify(passed.body));
+    const after = passed.body.state;
+    assert.deepEqual([...after.myRack].sort(), before.map(l => DOWN[l] ?? l).sort());
+    const changed = after.drawbacks.changed;
+    assert.equal(changed.length, before.filter(l => DOWN[l]).length);
+    assert.ok(changed.every(c => DOWN[c.was] === c.now), JSON.stringify(changed));
+
+    const unusual = await humanFirstGame(base, { player: 63, wally: 1 });
+    const u = unusual.state.drawbacks.changed;
+    assert.ok(u.every(c => c.now === 'U' && 'AEIO'.includes(c.was)));
+    assert.equal(unusual.state.myRack.length, 7);
+  } finally {
+    server.close();
+  }
+});

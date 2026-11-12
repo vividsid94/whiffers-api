@@ -21,10 +21,14 @@
 //   wallyHiddenPoints,             Nerf War points Wally's board hides until the end
 //   boardBeforeLastPlay,           for I'll Take That
 //   turnInfo: { turnIndex, playableCount, canExchange, forced, opened } (the human's turn)
+//   changed: { 1: [{ now, was }], 2: [...] }  Demotion / Unusual: rack tiles that
+//                                  aren't their original letter any more
+//   playedChanged: [{ now, was }]  such tiles that went onto the board (for good)
 // }
 
 import crypto from 'crypto';
 import { buildBoardForRequest, GO_SERVICE_URL } from '../rules/boardRequest.js';
+import { alphabetizeRack, removeTilesByCount } from '../rules/rack.js';
 import {
   applyBotMove, applyExchange, applyPass, applyHumanPlay, finalizeDrawbackLoss, finalizeNow, MoveError,
 } from './engine.js';
@@ -38,6 +42,7 @@ export const DRAWBACK_IDS = [
   42, 44, 50, 54, 55, 56, 62, 100, 101, 102, // batch 2 (100-102: Peer Pressure variants)
   48, 57, // batch 3
   41, 60, // batch 4
+  53, 63, // batch 5
 ];
 const QUOTA = 14;
 const SHIFTING_SANDS = 7;
@@ -51,6 +56,15 @@ const DEVIL = 57;
 const SHORT_HANDED = 41;
 const SHORT_HANDED_RACK = 6;
 const RESTLESSNESS = 60;
+const DEMOTION = 53;
+const UNUSUAL = 63;
+const UNUSUAL_CHANCE = 0.25;
+// Demotion: each letter drops to the next in its chain (the last stays put),
+// a blank drops to S. Same as drawbacks.go demotionChains - keep in step.
+const DEMOTES_TO = { '?': 'S' };
+for (const chain of ['EAIOU', 'ZXJKQ', 'SRNTL', 'HMDCYPBFGWV']) {
+  for (let i = 0; i + 1 < chain.length; i++) DEMOTES_TO[chain[i]] = chain[i + 1];
+}
 const DEVIL_CYCLE = 4;
 const BONUS_KINDS = ['DLS', 'DWS', 'TLS', 'TWS'];
 // Peer Pressure variants: how many rack tiles get highlighted each turn.
@@ -109,10 +123,87 @@ export function createDrawbackState(picks = {}) {
   };
 }
 
+// The opening deal under the drawbacks, run once right after they're dealt:
+// Short-handed's smaller rack, and Unusual's vowels.
+export function applyOpeningDeal(state) {
+  let next = applyRackSizes(state);
+  for (const p of [1, 2]) {
+    if (next.drawbacks.ids[p] !== UNUSUAL) continue;
+    const { rack, changed } = unusualDraws(next.racks[p], [], []);
+    next = { ...next, racks: { ...next.racks, [p]: alphabetizeRack(rack) }, drawbacks: { ...next.drawbacks, changed: { ...next.drawbacks.changed, [p]: changed } } };
+  }
+  return next;
+}
+
+// Unusual: each drawn vowel (A E I O) becomes a U with UNUSUAL_CHANCE.
+function unusualDraws(drawn, kept, changed) {
+  const out = [...changed];
+  const now = drawn.map((l) => {
+    if (!'AEIO'.includes(l) || randomInt(1000) >= UNUSUAL_CHANCE * 1000) return l;
+    out.push({ now: 'U', was: l });
+    return 'U';
+  });
+  return { rack: [...kept, ...now], changed: out };
+}
+
+// Demotion: every kept tile drops a step; a tile that already changed keeps
+// its original letter on record.
+function demoteKept(kept, drawn, changed) {
+  const pending = [...changed];
+  const out = [];
+  const now = kept.map((l) => {
+    const next = DEMOTES_TO[l] ?? l;
+    const i = pending.findIndex(c => c.now === l);
+    const was = i === -1 ? l : pending.splice(i, 1)[0].was;
+    if (next !== was) out.push({ now: next, was });
+    return next;
+  });
+  return { rack: [...now, ...drawn], changed: out };
+}
+
+// Demotion / Unusual, after the holder's turn: the tiles they used leave
+// the rack (a changed copy of a letter goes first - an exchanged one goes
+// back to the bag as its original letter, a played one stays changed on the
+// board), then Demotion drops the kept tiles and Unusual turns new vowels.
+export function changeLetters(before, after) {
+  const entry = after.history[after.history.length - 1];
+  if (!entry || entry.stepIn || !['play', 'exchange', 'pass'].includes(entry.type)) return after;
+  const p = entry.player;
+  const id = after.drawbacks.ids[p];
+  if (id !== DEMOTION && id !== UNUSUAL) return after;
+
+  const used = entry.type === 'play' ? entry.placed.map(t => (t.isBlank ? '?' : t.letter)) : (entry.exchanged ?? []);
+  const changed = [...(after.drawbacks.changed?.[p] ?? [])];
+  const taken = [];
+  for (const l of used) {
+    const i = changed.findIndex(c => c.now === l);
+    if (i !== -1) taken.push(changed.splice(i, 1)[0]);
+  }
+  let bag = after.bag;
+  let playedChanged = after.drawbacks.playedChanged ?? [];
+  if (entry.type === 'exchange' && taken.length) {
+    bag = [...bag];
+    for (const t of taken) bag[bag.lastIndexOf(t.now)] = t.was;
+  }
+  if (entry.type === 'play') playedChanged = [...playedChanged, ...taken];
+
+  const kept = removeTilesByCount(before.racks[p], used);
+  const drawn = removeTilesByCount(after.racks[p], kept);
+  let result = { rack: after.racks[p], changed };
+  if (id === DEMOTION && !after.ended) result = demoteKept(kept, drawn, changed);
+  if (id === UNUSUAL) result = unusualDraws(drawn, kept, changed);
+  return {
+    ...after,
+    bag,
+    racks: { ...after.racks, [p]: alphabetizeRack(result.rack) },
+    drawbacks: { ...after.drawbacks, changed: { ...after.drawbacks.changed, [p]: result.changed }, playedChanged },
+  };
+}
+
 // Short-handed: that player's rack holds 6 - one tile of the opening deal
 // goes back into the bag, and the engine refills to 6 from then on
-// (state.rackSizes). Run once, right after the drawbacks are dealt.
-export function applyRackSizes(state) {
+// (state.rackSizes).
+function applyRackSizes(state) {
   const sizes = {};
   const racks = { ...state.racks };
   const bag = [...state.bag];
@@ -340,7 +431,7 @@ const lossFrom = (losses) => {
 // six-pass. One breaker loses (scored 0); two at once cancel out.
 export async function afterDrawbackMove(before, after) {
   if (after.mode !== 'drawbacks') return after;
-  let next = after;
+  let next = changeLetters(before, after);
   const entry = next.history[next.history.length - 1];
   if (entry?.type === 'play' && !entry.stepIn) {
     next = { ...next, drawbacks: { ...next.drawbacks, boardBeforeLastPlay: buildBoardForRequest(before.board, before.blankTiles) } };

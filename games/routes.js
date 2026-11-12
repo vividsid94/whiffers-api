@@ -34,7 +34,7 @@ import { isValidWord, SUPPORTED_GAME_LEXICONS } from './dictionary.js';
 import { insertGame, loadGame, saveGame } from './repo.js';
 import { OPPONENTS, DEFAULT_OPPONENT_ID } from '../rules/opponents.js';
 import {
-  createDrawbackState, applyRackSizes, prepareHumanTurn, applyHumanDrawbackPlay, applyHumanDrawbackExchange,
+  createDrawbackState, applyOpeningDeal, prepareHumanTurn, applyHumanDrawbackPlay, applyHumanDrawbackExchange,
   afterDrawbackMove, DrawbacksUnavailableError, DRAWBACK_IDS,
 } from './drawbacks.js';
 
@@ -195,7 +195,7 @@ export function createGamesRouter(pool) {
       let state = createState({ mode, lexicon, opponentId: opponent, dailyDate: date, ...deal });
       if (mode === 'drawbacks') {
         state.drawbacks = createDrawbackState(picks);
-        state = applyRackSizes(state);
+        state = applyOpeningDeal(state);
         state = await prepareHumanTurn(state);
       }
       assertTileConservation(state);

@@ -51,6 +51,7 @@ function toClientDrawbacks(state, revealWally) {
     turnInfo: d.turnInfo?.turnIndex === turnIndex && state.currentPlayer === 1 && !state.ended ? d.turnInfo : null,
     loss: d.loss,
     wallyHiddenPoints: state.ended ? d.wallyHiddenPoints : 0,
+    changed: d.changed?.[1] ?? [],
   };
 }
 
