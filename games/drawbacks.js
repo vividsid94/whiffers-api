@@ -36,16 +36,18 @@ export const DRAWBACK_IDS = [
   ...Array.from({ length: 40 }, (_, i) => i + 1),
   43, 45, 46, 47, 49, 58, 61, // batch 1
   42, 44, 50, 54, 55, 56, 62, 100, 101, 102, // batch 2 (100-102: Peer Pressure variants)
+  48, 57, // batch 3
 ];
 const QUOTA = 14;
 const SHIFTING_SANDS = 7;
 const SHIFTING_SANDS_SQUARES = 60;
 const MINEFIELD = 38;
-const NERF_WAR = 17;
 const DROP_ZONE = 44;
 const GHOSTLY_PRESENCE = 55;
 const GHOST_CHANCE = 0.2;
 const FLAVOR_OF_THE_DAY = 62;
+const DEVIL = 57;
+const DEVIL_CYCLE = 4;
 const BONUS_KINDS = ['DLS', 'DWS', 'TLS', 'TWS'];
 // Peer Pressure variants: how many rack tiles get highlighted each turn.
 const PEER_PRESSURE_HIGHLIGHT = { 100: 4, 101: 3, 102: 5 };
@@ -170,9 +172,26 @@ function movesRequest(state, player, extra = {}) {
     quadrant: roll.quadrant,
     flavor: roll.flavor,
     highlighted: roll.highlighted,
+    mustObeyDevil: d.ids[player] === DEVIL && devilTurnsLeft(state.history, player) === 0,
     ...extra,
   };
 }
+
+// Devil On Your Shoulder: how many more of the player's turns until the
+// devil must be obeyed - 0 means this one. Counts the player's turns since
+// they last played the devil's move (entries flagged obeyedDevil).
+export function devilTurnsLeft(history, player) {
+  let since = 0;
+  for (const h of history) {
+    if (h.player !== player || h.stepIn) continue;
+    since = h.obeyedDevil ? 0 : since + 1;
+  }
+  return Math.max(0, DEVIL_CYCLE - 1 - since);
+}
+
+// A play's new tiles as a comparable key (Devil: did they play its move?).
+const placedKey = (tiles) => tiles.filter(t => t.isNew !== false)
+  .map(t => `${t.row},${t.col},${String(t.letter).toUpperCase()},${!!t.isBlank}`).sort().join(';');
 
 // The history fields every drawback play carries, from Go's judged move.
 function playExtra(move) {
@@ -210,6 +229,10 @@ export async function prepareHumanTurn(state) {
           canExchange: info.canExchange,
           forced: info.forced ?? null,
           opened: info.opened ?? [],
+          ...(next.drawbacks.ids[1] === DEVIL && info.devil ? {
+            devil: { word: info.devil.word, startPosition: info.devil.startPosition, score: info.devil.score, tiles: info.devil.tiles.filter(t => t.isNew) },
+            devilTurnsLeft: devilTurnsLeft(next.history, 1),
+          } : {}),
         },
       },
     };
@@ -230,7 +253,9 @@ export async function applyHumanDrawbackPlay(state, tiles, isValidWord) {
   if (!judged.proposedAllowed || !judged.proposed) {
     throw new MoveError('invalid_move', judged.proposedReason || "Your drawback doesn't allow that move");
   }
-  return applyHumanPlay(ready, tiles, isValidWord, ghostly(ready, 1, judged.proposed));
+  const scored = ghostly(ready, 1, judged.proposed);
+  if (judged.devil && placedKey(judged.devil.tiles) === placedKey(judged.proposed.tiles)) scored.extra.obeyedDevil = true;
+  return applyHumanPlay(ready, tiles, isValidWord, scored);
 }
 
 export async function applyHumanDrawbackExchange(state, letters) {
@@ -257,10 +282,14 @@ export async function runDrawbackBotTurn(state) {
   for (const move of data.moves ?? []) {
     try {
       if (move.isExchange) return applyExchange(ready, 2, move.exchangeTiles.split(''));
-      let next = applyBotMove(ready, move, ghostly(ready, 2, move));
-      // Nerf War: his board shows the normal score until the game ends.
-      const hidden = (move.fullScore ?? move.score) - move.score;
-      if (d.ids[2] === NERF_WAR && hidden > 0) {
+      const scored = ghostly(ready, 2, move);
+      if (data.devil && placedKey(data.devil.tiles) === placedKey(move.tiles)) scored.extra.obeyedDevil = true;
+      let next = applyBotMove(ready, move, scored);
+      // A drawback that cuts his score (Nerf War, Can I Buy a Vowel, Ghostly
+      // Presence) would give it away, so his board shows the normal score
+      // until the game ends.
+      const hidden = (move.fullScore ?? move.score) - scored.score;
+      if (hidden > 0) {
         const wallyHiddenPoints = d.wallyHiddenPoints + hidden;
         const history = [...next.history];
         history[history.length - 1] = { ...history[history.length - 1], hiddenAfter: wallyHiddenPoints };
