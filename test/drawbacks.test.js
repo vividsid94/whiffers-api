@@ -161,3 +161,23 @@ test('deferBot: the human move comes back before Wally moves, then /bot-turn pla
     server.close();
   }
 });
+
+test('drawbacks: Short-handed racks hold 6 (deal and refill); Restlessness shows each tile\'s count', { skip: skipGo }, async () => {
+  const { base, server } = await startServer();
+  try {
+    const game = await humanFirstGame(base, { player: 41, wally: 60 });
+    assert.equal(game.state.myRack.length, 6);
+    const best = await bestMove(game.state);
+    if (best) {
+      const ok = await move(base, game, game.state, 'play', { tiles: placedOf(best) });
+      assert.equal(ok.status, 200, JSON.stringify(ok.body));
+      assert.equal(ok.body.afterHuman.myRack.length, 6);
+    }
+    const restless = await humanFirstGame(base, { player: 60, wally: 41 });
+    const timers = restless.state.drawbacks.turnInfo.timers;
+    assert.equal(timers.length, 7);
+    assert.ok(timers.every(t => t.timer === 2), JSON.stringify(timers));
+  } finally {
+    server.close();
+  }
+});

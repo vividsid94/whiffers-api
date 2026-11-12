@@ -86,7 +86,8 @@ function commitPlay(state, player, tiles, words, opts = {}) {
   const score = opts.score ?? calculateScore(state.board, afterBoard, PREMIUM_GRID, [...state.blankTiles, ...newBlanks]);
   const rackBefore = state.racks[player];
   const rack = removeTilesByCount(rackBefore, tiles.map(t => (t.isBlank ? '?' : t.letter)));
-  drawTiles(rack, next.bag, 7 - rack.length);
+  // rackSizes (Drawbacks - Short-handed): a player whose rack holds fewer.
+  drawTiles(rack, next.bag, (state.rackSizes?.[player] ?? 7) - rack.length);
 
   next.board = afterBoard;
   next.blankTiles = [...state.blankTiles, ...newBlanks];

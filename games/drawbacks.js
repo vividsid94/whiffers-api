@@ -37,6 +37,7 @@ export const DRAWBACK_IDS = [
   43, 45, 46, 47, 49, 58, 61, // batch 1
   42, 44, 50, 54, 55, 56, 62, 100, 101, 102, // batch 2 (100-102: Peer Pressure variants)
   48, 57, // batch 3
+  41, 60, // batch 4
 ];
 const QUOTA = 14;
 const SHIFTING_SANDS = 7;
@@ -47,6 +48,9 @@ const GHOSTLY_PRESENCE = 55;
 const GHOST_CHANCE = 0.2;
 const FLAVOR_OF_THE_DAY = 62;
 const DEVIL = 57;
+const SHORT_HANDED = 41;
+const SHORT_HANDED_RACK = 6;
+const RESTLESSNESS = 60;
 const DEVIL_CYCLE = 4;
 const BONUS_KINDS = ['DLS', 'DWS', 'TLS', 'TWS'];
 // Peer Pressure variants: how many rack tiles get highlighted each turn.
@@ -103,6 +107,23 @@ export function createDrawbackState(picks = {}) {
     boardBeforeLastPlay: null,
     turnInfo: null,
   };
+}
+
+// Short-handed: that player's rack holds 6 - one tile of the opening deal
+// goes back into the bag, and the engine refills to 6 from then on
+// (state.rackSizes). Run once, right after the drawbacks are dealt.
+export function applyRackSizes(state) {
+  const sizes = {};
+  const racks = { ...state.racks };
+  const bag = [...state.bag];
+  for (const p of [1, 2]) {
+    if (state.drawbacks.ids[p] !== SHORT_HANDED) continue;
+    sizes[p] = SHORT_HANDED_RACK;
+    const rack = [...racks[p]];
+    while (rack.length > SHORT_HANDED_RACK) bag.push(rack.splice(randomInt(rack.length), 1)[0]);
+    racks[p] = rack;
+  }
+  return Object.keys(sizes).length ? { ...state, racks, bag, rackSizes: sizes } : state;
 }
 
 // This turn's rolls for whoever is to move (made once, then kept).
@@ -229,6 +250,7 @@ export async function prepareHumanTurn(state) {
           canExchange: info.canExchange,
           forced: info.forced ?? null,
           opened: info.opened ?? [],
+          ...(next.drawbacks.ids[1] === RESTLESSNESS && info.timers ? { timers: info.timers } : {}),
           ...(next.drawbacks.ids[1] === DEVIL && info.devil ? {
             devil: { word: info.devil.word, startPosition: info.devil.startPosition, score: info.devil.score, tiles: info.devil.tiles.filter(t => t.isNew) },
             devilTurnsLeft: devilTurnsLeft(next.history, 1),
