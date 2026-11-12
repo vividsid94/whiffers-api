@@ -75,10 +75,15 @@ test('drawbacks: you see your own drawback, not Wally\'s (until peek)', { skip: 
 test('drawbacks: Fear of Heights refuses a vertical opener, takes the horizontal one', { skip: skipGo }, async () => {
   const { base, server } = await startServer();
   try {
-    const game = await humanFirstGame(base, { player: 1, wally: 15 });
-    const best = await bestMove(game.state);
-    const across = placedOf(best);
-    if (across.length < 2) return; // a one-tile opener has no direction to test
+    // A deal whose rack has an opening play of 2+ tiles (some racks have none).
+    let game;
+    let across = [];
+    for (let i = 0; i < 10 && across.length < 2; i++) {
+      game = await humanFirstGame(base, { player: 1, wally: 15 });
+      const best = await bestMove(game.state);
+      across = best ? placedOf(best) : [];
+    }
+    if (across.length < 2) return;
     const down = across.map(t => ({ ...t, row: t.col, col: t.row }));
     const refused = await move(base, game, game.state, 'play', { tiles: down });
     assert.equal(refused.status, 422);
@@ -131,6 +136,27 @@ test('drawbacks: a whole game plays through (human plays its best move, or passe
     }
     assert.ok(snap.ended, 'game finished');
     assert.ok(snap.final);
+  } finally {
+    server.close();
+  }
+});
+
+test('deferBot: the human move comes back before Wally moves, then /bot-turn plays him', { skip: skipGo }, async () => {
+  const { base, server } = await startServer();
+  try {
+    let game;
+    for (let i = 0; i < 20 && !game; i++) {
+      const created = await call(base, 'POST', '', { body: { mode: 'classic', opponentId: 'wally' } });
+      if (created.body.state.currentPlayer === 1) game = created.body;
+    }
+    const res = await move(base, game, game.state, 'pass', { deferBot: true });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(res.body.bot.status, 'deferred');
+    assert.equal(res.body.state.currentPlayer, 2);
+    assert.equal(res.body.state.botPending, true);
+    const bot = await call(base, 'POST', `/${game.gameId}/bot-turn`, { token: game.token });
+    assert.equal(bot.status, 200, JSON.stringify(bot.body));
+    assert.equal(bot.body.state.history.length, 2);
   } finally {
     server.close();
   }

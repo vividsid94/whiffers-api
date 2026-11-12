@@ -24,12 +24,14 @@ export function createFakePool() {
         return { rows: row ? [{ ...row, state: jsonClone(row.state), last_response: jsonClone(row.last_response) }] : [] };
       }
       if (s.startsWith('UPDATE games SET state = $3')) {
-        const [id, expected, state, status] = params;
+        const [id, expected, state, status, , , , clientMoveId, response] = params;
         const row = rows.get(id);
         if (!row || row.version !== expected) return { rows: [], rowCount: 0 };
         row.state = jsonClone(state);
         row.version += 1;
         row.status = status;
+        if (clientMoveId != null) row.last_client_move_id = clientMoveId;
+        if (response != null) row.last_response = jsonClone(response);
         return { rows: [{ version: row.version }], rowCount: 1 };
       }
       if (s.startsWith('UPDATE games SET last_client_move_id')) {

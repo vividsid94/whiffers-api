@@ -15,7 +15,9 @@
 // A move response is { human, afterHuman, bot, state }: afterHuman is the
 // snapshot right after the human's move, so the client can show it before
 // staging the bot's reply; bot is null (game ended), { status: 'done', ... }
-// or { status: 'pending' } (Go unreachable - retry with /bot-turn; never a pass).
+// or { status: 'pending' } (Go unreachable - retry with /bot-turn; never a pass),
+// or { status: 'deferred' } (the client sent deferBot: true and will call
+// /bot-turn itself, so the human's move is answered without waiting on Wally).
 
 import crypto from 'crypto';
 import express from 'express';
@@ -29,7 +31,7 @@ import { toClientSnapshot } from './view.js';
 import { runBotTurn, summarizeBotMove, BotUnavailableError } from './bot.js';
 import { classicDeal, dailyDeal, isDailyAvailable, isPlayableDailyDate } from './daily.js';
 import { isValidWord, SUPPORTED_GAME_LEXICONS } from './dictionary.js';
-import { insertGame, loadGame, saveGame, cacheResponse } from './repo.js';
+import { insertGame, loadGame, saveGame } from './repo.js';
 import { OPPONENTS, DEFAULT_OPPONENT_ID } from '../rules/opponents.js';
 import {
   createDrawbackState, prepareHumanTurn, applyHumanDrawbackPlay, applyHumanDrawbackExchange,
@@ -247,7 +249,12 @@ export function createGamesRouter(pool) {
 
     let final = afterHuman;
     let bot = null;
-    if (!afterHuman.ended && afterHuman.currentPlayer === 2) {
+    // deferBot: answer the human's move straight away and let the client
+    // ask for Wally's reply with /bot-turn - so the human's tiles and move
+    // sound land at once instead of waiting for Wally to think.
+    if (req.body?.deferBot === true && !afterHuman.ended && afterHuman.currentPlayer === 2) {
+      bot = { status: 'deferred' };
+    } else if (!afterHuman.ended && afterHuman.currentPlayer === 2) {
       try {
         final = (await runBotTurn(afterHuman)).state;
         final = await afterDrawbackMove(afterHuman, final);
@@ -262,20 +269,22 @@ export function createGamesRouter(pool) {
     }
     final = await prepareHumanTurn(final);
 
-    const newVersion = await saveGame(pool, row.id, row.version, final);
-    if (newVersion === null) {
-      const fresh = await loadGame(pool, row.id);
-      throw new HttpError(409, { error: 'version_conflict', state: toClientSnapshot(fresh.id, fresh.version, fresh.state) });
-    }
-    // afterHuman's version is the one just saved when the bot didn't move,
-    // otherwise the client only needs it to draw the in-between board.
+    // The save bumps the version by exactly one, so the reply (which carries
+    // it) is built first and stored with the state in a single write - the
+    // retry cache. afterHuman's version is the one saved when the bot didn't
+    // move; otherwise the client only needs it to draw the in-between board.
+    const newVersion = row.version + 1;
     const body = {
       human: humanSummary(afterHuman),
       afterHuman: toClientSnapshot(row.id, newVersion, afterHuman),
       bot,
       state: toClientSnapshot(row.id, newVersion, final),
     };
-    await cacheResponse(pool, row.id, newVersion, meta.clientMoveId, body);
+    const saved = await saveGame(pool, row.id, row.version, final, { clientMoveId: meta.clientMoveId, response: body });
+    if (saved === null) {
+      const fresh = await loadGame(pool, row.id);
+      throw new HttpError(409, { error: 'version_conflict', state: toClientSnapshot(fresh.id, fresh.version, fresh.state) });
+    }
     res.json(body);
   }
 

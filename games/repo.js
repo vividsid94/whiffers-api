@@ -47,7 +47,10 @@ export async function loadGame(pool, id) {
 }
 
 // Returns the new version, or null if someone else wrote first.
-export async function saveGame(pool, id, expectedVersion, state) {
+// cache (a human move): { clientMoveId, response } - the move's idempotency
+// cache, written in the same UPDATE so a move costs one database write. The
+// response already carries the new version (always expectedVersion + 1).
+export async function saveGame(pool, id, expectedVersion, state, cache = null) {
   const ended = state.ended;
   const { rows } = await pool.query(
     `UPDATE games SET
@@ -56,7 +59,9 @@ export async function saveGame(pool, id, expectedVersion, state) {
        status = $4,
        final_p1 = $5, final_p2 = $6, winner = $7,
        ended_at = CASE WHEN $4 = 'ended' THEN COALESCE(ended_at, now()) ELSE NULL END,
-       updated_at = now()
+       updated_at = now(),
+       last_client_move_id = COALESCE($8, last_client_move_id),
+       last_response = COALESCE($9, last_response)
      WHERE id = $1 AND version = $2
      RETURNING version`,
     [
@@ -64,18 +69,11 @@ export async function saveGame(pool, id, expectedVersion, state) {
       ended ? state.final.player1Score : null,
       ended ? state.final.player2Score : null,
       ended ? state.final.winner : null,
+      cache?.clientMoveId ?? null,
+      cache?.response ?? null,
     ],
   );
   return rows[0]?.version ?? null;
-}
-
-// The idempotency cache for a move: the response that was sent, keyed by
-// the client's move id, written once the version for it is known.
-export async function cacheResponse(pool, id, version, clientMoveId, response) {
-  await pool.query(
-    'UPDATE games SET last_client_move_id = $3, last_response = $4 WHERE id = $1 AND version = $2',
-    [id, version, clientMoveId, response],
-  );
 }
 
 // Finished games are kept a month, abandoned ones two weeks.
