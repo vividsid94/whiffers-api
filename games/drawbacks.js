@@ -29,8 +29,13 @@ import {
   applyBotMove, applyExchange, applyPass, applyHumanPlay, finalizeDrawbackLoss, finalizeNow, MoveError,
 } from './engine.js';
 
-// Every drawback the Go registry has (#1-#40).
-export const DRAWBACK_IDS = Array.from({ length: 40 }, (_, i) => i + 1);
+// Every drawback the Go registry has: the original #1-#40, plus the new ones
+// as they're built (his list, #41-#64). Add an id here when its rule lands
+// in drawbacks.go.
+export const DRAWBACK_IDS = [
+  ...Array.from({ length: 40 }, (_, i) => i + 1),
+  43, 45, 46, 47, 49, 58, 61, // batch 1
+];
 const QUOTA = 14;
 const SHIFTING_SANDS = 7;
 const SHIFTING_SANDS_SQUARES = 60;
