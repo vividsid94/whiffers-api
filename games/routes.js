@@ -1,4 +1,4 @@
-// HTTP API for server-run games (Classic + Daily). Mounted at /games by
+// HTTP API for server-run games (Classic, Daily, Drawbacks). Mounted at /games by
 // index.js. Ownership is a secret token handed out at creation - no
 // accounts: whoever holds it can move in that game, nobody else can (a
 // wrong token looks exactly like a missing game). Only a sha256 of the
@@ -31,8 +31,12 @@ import { classicDeal, dailyDeal, isDailyAvailable, isPlayableDailyDate } from '.
 import { isValidWord, SUPPORTED_GAME_LEXICONS } from './dictionary.js';
 import { insertGame, loadGame, saveGame, cacheResponse } from './repo.js';
 import { OPPONENTS, DEFAULT_OPPONENT_ID } from '../rules/opponents.js';
+import {
+  createDrawbackState, prepareHumanTurn, applyHumanDrawbackPlay, applyHumanDrawbackExchange,
+  afterDrawbackMove, DrawbacksUnavailableError, DRAWBACK_IDS,
+} from './drawbacks.js';
 
-const MODES = ['classic', 'daily'];
+const MODES = ['classic', 'daily', 'drawbacks'];
 const OPPONENT_IDS = OPPONENTS.map(o => o.id);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MOVE_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
@@ -106,6 +110,26 @@ async function loadOwnedGame(pool, req) {
   return row;
 }
 
+// Drawbacks: Go judges the drawback rules, so when it can't be reached a
+// human move can't be judged either - the same 503 a pending bot turn gets,
+// and the client holds the game until it's back.
+function unavailable(snapshot) {
+  return new HttpError(503, { error: 'bot_unavailable', state: snapshot });
+}
+
+// Drawbacks: the start screen's Testing picker can force either side's
+// drawback - { player, wally }, each an id or null for random.
+function parseDrawbackPicks(raw) {
+  if (raw == null) return {};
+  if (typeof raw !== 'object') throw bad('drawbackIds must be an object');
+  const pick = (v) => {
+    if (v == null) return undefined;
+    if (!DRAWBACK_IDS.includes(v)) throw bad('unknown drawback id');
+    return v;
+  };
+  return { player: pick(raw.player), wally: pick(raw.wally) };
+}
+
 function moveErrorToHttp(err, snapshot) {
   if (err.code === 'invalid_move') {
     return new HttpError(422, {
@@ -147,7 +171,7 @@ export function createGamesRouter(pool) {
   router.post('/', createLimiter, async (req, res, next) => {
     try {
       const { mode, lexicon = 'NWL23', opponentId = DEFAULT_OPPONENT_ID, dailyDate } = req.body ?? {};
-      if (!MODES.includes(mode)) throw bad('mode must be classic or daily');
+      if (!MODES.includes(mode)) throw bad('mode must be classic, daily or drawbacks');
       if (!SUPPORTED_GAME_LEXICONS.includes(lexicon)) throw bad('unsupported lexicon');
       if (!OPPONENT_IDS.includes(opponentId)) throw bad('unknown opponent');
 
@@ -163,8 +187,14 @@ export function createGamesRouter(pool) {
       } else {
         deal = classicDeal();
       }
+      const picks = mode === 'drawbacks' ? parseDrawbackPicks(req.body?.drawbackIds) : null;
+      if (mode === 'drawbacks') opponent = DEFAULT_OPPONENT_ID; // Drawbacks is always against Wally
 
-      const state = createState({ mode, lexicon, opponentId: opponent, dailyDate: date, ...deal });
+      let state = createState({ mode, lexicon, opponentId: opponent, dailyDate: date, ...deal });
+      if (mode === 'drawbacks') {
+        state.drawbacks = createDrawbackState(picks);
+        state = await prepareHumanTurn(state);
+      }
       assertTileConservation(state);
       const id = crypto.randomUUID();
       const token = crypto.randomBytes(32).toString('base64url');
@@ -178,7 +208,8 @@ export function createGamesRouter(pool) {
   router.get('/:id', moveLimiter, async (req, res, next) => {
     try {
       const row = await loadOwnedGame(pool, req);
-      res.json({ state: toClientSnapshot(row.id, row.version, row.state) });
+      // ?peek=1: reveal Wally's drawback mid-game (the panel's "Peek (test)").
+      res.json({ state: toClientSnapshot(row.id, row.version, row.state, { peek: req.query.peek === '1' }) });
     } catch (err) {
       next(err);
     }
@@ -202,9 +233,14 @@ export function createGamesRouter(pool) {
 
     let afterHuman;
     try {
-      afterHuman = applyHuman(row.state);
+      afterHuman = await applyHuman(row.state);
+      afterHuman = await afterDrawbackMove(row.state, afterHuman);
     } catch (err) {
       if (err instanceof MoveError) throw moveErrorToHttp(err, current);
+      if (err instanceof DrawbacksUnavailableError) {
+        console.error(`Game ${row.id}: drawbacks unavailable -`, err.message);
+        throw unavailable(current);
+      }
       throw err;
     }
     assertTileConservation(afterHuman);
@@ -214,15 +250,17 @@ export function createGamesRouter(pool) {
     if (!afterHuman.ended && afterHuman.currentPlayer === 2) {
       try {
         final = (await runBotTurn(afterHuman)).state;
+        final = await afterDrawbackMove(afterHuman, final);
         assertTileConservation(final);
         bot = summarizeBotMove(afterHuman, final);
       } catch (err) {
-        if (!(err instanceof BotUnavailableError)) throw err;
+        if (!(err instanceof BotUnavailableError) && !(err instanceof DrawbacksUnavailableError)) throw err;
         console.error(`Game ${row.id}: bot pending -`, err.message);
         final = afterHuman;
         bot = { status: 'pending' };
       }
     }
+    final = await prepareHumanTurn(final);
 
     const newVersion = await saveGame(pool, row.id, row.version, final);
     if (newVersion === null) {
@@ -244,7 +282,10 @@ export function createGamesRouter(pool) {
   router.post('/:id/play', moveLimiter, async (req, res, next) => {
     try {
       const tiles = parseTiles(req.body?.tiles);
-      await humanMove(req, res, (state) => applyHumanPlay(state, tiles, (w) => isValidWord(state.lexicon, w)));
+      await humanMove(req, res, (state) => {
+        const isValid = (w) => isValidWord(state.lexicon, w);
+        return state.mode === 'drawbacks' ? applyHumanDrawbackPlay(state, tiles, isValid) : applyHumanPlay(state, tiles, isValid);
+      });
     } catch (err) {
       next(err);
     }
@@ -253,7 +294,9 @@ export function createGamesRouter(pool) {
   router.post('/:id/exchange', moveLimiter, async (req, res, next) => {
     try {
       const letters = parseExchangeLetters(req.body?.tiles);
-      await humanMove(req, res, (state) => applyExchange(state, 1, letters));
+      await humanMove(req, res, (state) => (state.mode === 'drawbacks'
+        ? applyHumanDrawbackExchange(state, letters)
+        : applyExchange(state, 1, letters)));
     } catch (err) {
       next(err);
     }
@@ -297,8 +340,10 @@ export function createGamesRouter(pool) {
       let final;
       try {
         final = (await runBotTurn(row.state)).state;
+        final = await afterDrawbackMove(row.state, final);
+        final = await prepareHumanTurn(final);
       } catch (err) {
-        if (err instanceof BotUnavailableError) {
+        if (err instanceof BotUnavailableError || err instanceof DrawbacksUnavailableError) {
           console.error(`Game ${row.id}: bot pending -`, err.message);
           throw new HttpError(503, { error: 'bot_unavailable', state: current });
         }

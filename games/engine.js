@@ -1,4 +1,5 @@
-// The authoritative game engine for server-run games (Classic + Daily).
+// The authoritative game engine for server-run games (Classic, Daily and
+// Drawbacks - drawbacks.js adds that mode's rules around these functions).
 // Pure functions over a plain state object: no database, no network, no
 // clock. routes.js loads a state, calls one of these, saves the result.
 //
@@ -72,7 +73,9 @@ function assertTurn(state, player) {
 // Places `tiles` ({row, col, letter, isBlank}) for `player` and commits the
 // play: score, refill, history, then end-or-switch. Shared by the human path
 // (after dictionary checks) and the bot path (Go's move, already legal).
-function commitPlay(state, player, tiles, words) {
+// opts (Drawbacks only): score - what the play scores under the player's
+// drawback (Nerf War); extra - more fields for the history entry.
+function commitPlay(state, player, tiles, words, opts = {}) {
   const next = clone(state);
   const afterBoard = clone(state.board);
   const newBlanks = [];
@@ -80,7 +83,7 @@ function commitPlay(state, player, tiles, words) {
     afterBoard[t.row][t.col] = t.letter;
     if (t.isBlank) newBlanks.push({ row: t.row, col: t.col });
   }
-  const score = calculateScore(state.board, afterBoard, PREMIUM_GRID, [...state.blankTiles, ...newBlanks]);
+  const score = opts.score ?? calculateScore(state.board, afterBoard, PREMIUM_GRID, [...state.blankTiles, ...newBlanks]);
   const rackBefore = state.racks[player];
   const rack = removeTilesByCount(rackBefore, tiles.map(t => (t.isBlank ? '?' : t.letter)));
   drawTiles(rack, next.bag, 7 - rack.length);
@@ -99,6 +102,7 @@ function commitPlay(state, player, tiles, words) {
     total: next.scores[player],
     rack: rackBefore.join(''),
     isBingo: tiles.length === 7,
+    ...opts.extra,
   });
 
   if (next.racks[player].length === 0 && next.bag.length === 0) return finalize(next, 'wentOut');
@@ -108,7 +112,7 @@ function commitPlay(state, player, tiles, words) {
 
 // The human's word play. `isValidWord(word)` is the lexicon check (games/
 // dictionary.js), passed in so this stays pure and testable.
-export function applyHumanPlay(state, tiles, isValidWord) {
+export function applyHumanPlay(state, tiles, isValidWord, opts = {}) {
   assertTurn(state, 1);
   if (!Array.isArray(tiles) || tiles.length < 1 || tiles.length > 7) {
     throw new MoveError('invalid_move', 'Place between 1 and 7 tiles');
@@ -139,7 +143,7 @@ export function applyHumanPlay(state, tiles, isValidWord) {
     );
   }
 
-  return commitPlay(state, 1, tiles, placement.words);
+  return commitPlay(state, 1, tiles, placement.words, opts);
 }
 
 // letters: the tiles to swap ('?' for a blank). Needs 7+ in the bag.
@@ -189,7 +193,17 @@ export function applyPass(state, player) {
 
 function afterScorelessTurn(next, player) {
   next.scorelessRun += 1;
-  if (next.scorelessRun >= SCORELESS_TURNS_TO_END) return finalize(next, 'sixScoreless');
+  if (next.scorelessRun >= SCORELESS_TURNS_TO_END) {
+    // Drawbacks: six scoreless turns on an empty board means neither
+    // drawback can open - Wally steps in with an opener instead of the game
+    // ending (drawbacks.js stepIn).
+    if (next.mode === 'drawbacks' && isBoardEmpty(next.board)) {
+      next.stepInPending = true;
+      next.currentPlayer = other(player);
+      return next;
+    }
+    return finalize(next, 'sixScoreless');
+  }
   next.currentPlayer = other(player);
   return next;
 }
@@ -199,7 +213,7 @@ function afterScorelessTurn(next, player) {
 // board and rack before it lands - Go is trusted for word validity in its
 // own lexicon, not for which tiles the bot actually holds. The score is
 // recomputed here with the same calculateScore the human gets.
-export function applyBotMove(state, move) {
+export function applyBotMove(state, move, opts = {}) {
   assertTurn(state, 2);
   if (move.isExchange) {
     return applyExchange(state, 2, move.tiles.map(t => t.letter));
@@ -220,7 +234,7 @@ export function applyBotMove(state, move) {
   for (const t of tiles) afterBoard[t.row][t.col] = t.letter;
   const placement = validatePlacement(state.board, afterBoard);
   if (!placement.isValid) throw new MoveError('invalid_move', `Bot move: ${placement.reason}`);
-  return commitPlay(state, 2, tiles, placement.words);
+  return commitPlay(state, 2, tiles, placement.words, opts);
 }
 
 // The human resigns: the game ends now and the bot wins.
@@ -229,6 +243,29 @@ export function applyResign(state) {
   const next = clone(state);
   next.history.push({ player: 1, type: 'resign', placed: [], words: [], score: 0, total: next.scores[1] });
   return finalize(next, 'resigned');
+}
+
+export const isBoardEmpty = (board) => board.every(row => row.every(cell => !isLetter(cell)));
+
+// Drawbacks: a lose condition ended the game. `loserPlayer` scores 0 and the
+// winner keeps their score as it stands (so the winner always has more).
+export function finalizeDrawbackLoss(state, loserPlayer) {
+  const next = clone(state);
+  next.ended = true;
+  next.endReason = 'drawbackLoss';
+  next.stepInPending = false;
+  next.final = {
+    player1Score: loserPlayer === 1 ? 0 : next.scores[1],
+    player2Score: loserPlayer === 2 ? 0 : next.scores[2],
+    winner: loserPlayer === 1 ? 'bot' : 'player',
+  };
+  return next;
+}
+
+// Drawbacks: both players broke a lose condition at once mid-game - the
+// losses cancel and the game ends here, scored normally.
+export function finalizeNow(state, endReason) {
+  return finalize(clone(state), endReason);
 }
 
 // Ends the game in place - only ever called on a state this module has

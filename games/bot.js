@@ -7,6 +7,7 @@
 import { buildBoardForRequest, GO_SERVICE_URL } from '../rules/boardRequest.js';
 import { getOpponent, pickCandidateAtRank } from '../rules/opponents.js';
 import { applyBotMove, applyExchange, applyPass, MoveError } from './engine.js';
+import { runDrawbackBotTurn, DrawbacksUnavailableError } from './drawbacks.js';
 
 const GO_TIMEOUT_MS = 12000;
 // Same "big play" bar the frontend's Ease the Blow uses.
@@ -56,6 +57,15 @@ function applyFirstLegal(state, preferred, candidates) {
 
 // Returns { state, mood } with the bot's move applied.
 export async function runBotTurn(state) {
+  // Drawbacks: Wally plays the best move his drawback allows (drawbacks.js).
+  if (state.mode === 'drawbacks') {
+    try {
+      return { state: await runDrawbackBotTurn(state), mood: state.opponentMood };
+    } catch (err) {
+      if (err instanceof DrawbacksUnavailableError) throw new BotUnavailableError(err.message);
+      throw err;
+    }
+  }
   const opponent = getOpponent(state.opponentId);
   let next;
   let mood = state.opponentMood;
