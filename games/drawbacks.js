@@ -35,12 +35,21 @@ import {
 export const DRAWBACK_IDS = [
   ...Array.from({ length: 40 }, (_, i) => i + 1),
   43, 45, 46, 47, 49, 58, 61, // batch 1
+  42, 44, 50, 54, 55, 56, 62, 100, 101, 102, // batch 2 (100-102: Peer Pressure variants)
 ];
 const QUOTA = 14;
 const SHIFTING_SANDS = 7;
 const SHIFTING_SANDS_SQUARES = 60;
 const MINEFIELD = 38;
 const NERF_WAR = 17;
+const DROP_ZONE = 44;
+const GHOSTLY_PRESENCE = 55;
+const GHOST_CHANCE = 0.2;
+const FLAVOR_OF_THE_DAY = 62;
+const BONUS_KINDS = ['DLS', 'DWS', 'TLS', 'TWS'];
+// Peer Pressure variants: how many rack tiles get highlighted each turn.
+const PEER_PRESSURE_HIGHLIGHT = { 100: 4, 101: 3, 102: 5 };
+const ROLLED = new Set([QUOTA, SHIFTING_SANDS, DROP_ZONE, FLAVOR_OF_THE_DAY, ...Object.keys(PEER_PRESSURE_HIGHLIGHT).map(Number)]);
 
 const GO_TIMEOUT_MS = 15000;
 const STEP_IN_DRAWS = 5;
@@ -98,9 +107,20 @@ export function createDrawbackState(picks = {}) {
 function ensureRolls(state) {
   const turnIndex = state.history.length;
   const id = state.drawbacks.ids[state.currentPlayer];
-  if (state.drawbacks.rolls[turnIndex] || (id !== QUOTA && id !== SHIFTING_SANDS)) return state;
+  if (state.drawbacks.rolls[turnIndex] || !ROLLED.has(id)) return state;
   const roll = {};
   if (id === QUOTA) roll.quota = [1 + randomInt(7), 1 + randomInt(7)];
+  if (id === DROP_ZONE) roll.quadrant = randomInt(4);
+  if (id === FLAVOR_OF_THE_DAY) roll.flavor = BONUS_KINDS[randomInt(BONUS_KINDS.length)];
+  if (PEER_PRESSURE_HIGHLIGHT[id]) {
+    // Specific tiles from the rack as it stands at the start of the turn.
+    const rack = [...state.racks[state.currentPlayer]];
+    for (let i = rack.length - 1; i > 0; i--) {
+      const j = randomInt(i + 1);
+      [rack[i], rack[j]] = [rack[j], rack[i]];
+    }
+    roll.highlighted = rack.slice(0, PEER_PRESSURE_HIGHLIGHT[id]).join('');
+  }
   if (id === SHIFTING_SANDS) {
     const squares = [];
     for (let r = 0; r < 15; r++) for (let c = 0; c < 15; c++) if (!(r === 7 && c === 7)) squares.push([r, c]);
@@ -147,6 +167,9 @@ function movesRequest(state, player, extra = {}) {
     boardBeforeLastPlay: d.boardBeforeLastPlay ?? undefined,
     blockedSquares: roll.blocked,
     quota: roll.quota,
+    quadrant: roll.quadrant,
+    flavor: roll.flavor,
+    highlighted: roll.highlighted,
     ...extra,
   };
 }
@@ -154,6 +177,16 @@ function movesRequest(state, player, extra = {}) {
 // The history fields every drawback play carries, from Go's judged move.
 function playExtra(move) {
   return { simTiles: move.tiles, direction: move.direction, wordStarts: move.wordStarts ?? [], fullScore: move.fullScore };
+}
+
+// Ghostly Presence: once a play is chosen, a chance it scores 0 - rolled
+// after the move, so nobody can plan around it. Returns the play's score
+// and history extras.
+function ghostly(state, player, move) {
+  if (state.drawbacks.ids[player] !== GHOSTLY_PRESENCE || crypto.randomInt(1000) >= GHOST_CHANCE * 1000) {
+    return { score: move.score, extra: playExtra(move) };
+  }
+  return { score: 0, extra: { ...playExtra(move), ghosted: true } };
 }
 
 // --- The human's turn -------------------------------------------------------
@@ -197,8 +230,7 @@ export async function applyHumanDrawbackPlay(state, tiles, isValidWord) {
   if (!judged.proposedAllowed || !judged.proposed) {
     throw new MoveError('invalid_move', judged.proposedReason || "Your drawback doesn't allow that move");
   }
-  const move = judged.proposed;
-  return applyHumanPlay(ready, tiles, isValidWord, { score: move.score, extra: playExtra(move) });
+  return applyHumanPlay(ready, tiles, isValidWord, ghostly(ready, 1, judged.proposed));
 }
 
 export async function applyHumanDrawbackExchange(state, letters) {
@@ -225,7 +257,7 @@ export async function runDrawbackBotTurn(state) {
   for (const move of data.moves ?? []) {
     try {
       if (move.isExchange) return applyExchange(ready, 2, move.exchangeTiles.split(''));
-      let next = applyBotMove(ready, move, { score: move.score, extra: playExtra(move) });
+      let next = applyBotMove(ready, move, ghostly(ready, 2, move));
       // Nerf War: his board shows the normal score until the game ends.
       const hidden = (move.fullScore ?? move.score) - move.score;
       if (d.ids[2] === NERF_WAR && hidden > 0) {

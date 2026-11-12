@@ -78,6 +78,7 @@ function toClientHistoryEntry(h, reveal, hiddenSoFar = 0) {
     isBingo: !!h.isBingo,
   };
   if (h.stepIn) entry.stepIn = true;
+  if (h.ghosted) entry.ghosted = true; // Ghostly Presence turned this play's score to 0
   if (h.player === 1 || reveal) {
     if (h.rack !== undefined) entry.rack = h.rack;
     if (h.exchanged) entry.exchanged = h.exchanged;
