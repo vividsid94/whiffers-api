@@ -52,6 +52,12 @@ function toClientDrawbacks(state, revealWally) {
     loss: d.loss,
     wallyHiddenPoints: state.ended ? d.wallyHiddenPoints : 0,
     changed: d.changed?.[1] ?? [],
+    // Regicide / Decay / Goose Egg: what your tiles are worth to you, where
+    // that isn't the normal value.
+    values: {
+      rack: d.values?.[1]?.rack ?? [],
+      board: Object.entries(d.values?.[1]?.board ?? {}).map(([key, value]) => [...key.split(',').map(Number), value]),
+    },
   };
 }
 

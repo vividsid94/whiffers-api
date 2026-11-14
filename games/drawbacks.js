@@ -24,11 +24,19 @@
 //   changed: { 1: [{ now, was }], 2: [...] }  Demotion / Unusual: rack tiles that
 //                                  aren't their original letter any more
 //   playedChanged: [{ now, was }]  such tiles that went onto the board (for good)
+//   values: { 1: { rack: [{ letter, value }], board: { "r,c": value } }, 2: ... }
+//                                  Regicide / Decay / Goose Egg: what tiles are worth
+//                                  to that player, where it isn't the normal value
+//                                  (rack: one entry per affected copy)
+//   regicideBag: [{ holder, letter, fromEnd }]  Regicide tiles exchanged back into
+//                                  the bag (still 0 if their holder draws them again)
+//   valueTurn                      the turn the start-of-turn zeroing last ran on
 // }
 
 import crypto from 'crypto';
 import { buildBoardForRequest, GO_SERVICE_URL } from '../rules/boardRequest.js';
 import { alphabetizeRack, removeTilesByCount } from '../rules/rack.js';
+import { letterScores } from '../rules/scoreFunctions.js';
 import {
   applyBotMove, applyExchange, applyPass, applyHumanPlay, finalizeDrawbackLoss, finalizeNow, MoveError,
 } from './engine.js';
@@ -43,6 +51,7 @@ export const DRAWBACK_IDS = [
   48, 57, // batch 3
   41, 60, // batch 4
   53, 63, // batch 5
+  51, 52, 64, // batch 6
 ];
 const QUOTA = 14;
 const SHIFTING_SANDS = 7;
@@ -59,6 +68,14 @@ const RESTLESSNESS = 60;
 const DEMOTION = 53;
 const UNUSUAL = 63;
 const UNUSUAL_CHANCE = 0.25;
+const REGICIDE = 51;
+const DECAY = 52;
+const GOOSE_EGG = 64;
+const GOOSE_EGGS = 2;
+const VALUED = new Set([REGICIDE, DECAY, GOOSE_EGG]);
+// Drawbacks whose score cut would give Wally's drawback away - his board
+// shows normal scores until the game ends.
+const HIDDEN_SCORE_CUTS = new Set([17, 48, 55, REGICIDE, DECAY, GOOSE_EGG]);
 // Demotion: each letter drops to the next in its chain (the last stays put),
 // a blank drops to S. Same as drawbacks.go demotionChains - keep in step.
 const DEMOTES_TO = { '?': 'S' };
@@ -132,7 +149,7 @@ export function applyOpeningDeal(state) {
     const { rack, changed } = unusualDraws(next.racks[p], [], []);
     next = { ...next, racks: { ...next.racks, [p]: alphabetizeRack(rack) }, drawbacks: { ...next.drawbacks, changed: { ...next.drawbacks.changed, [p]: changed } } };
   }
-  return next;
+  return startTurnValues(next);
 }
 
 // Unusual: each drawn vowel (A E I O) becomes a U with UNUSUAL_CHANCE.
@@ -197,6 +214,140 @@ export function changeLetters(before, after) {
     bag,
     racks: { ...after.racks, [p]: alphabetizeRack(result.rack) },
     drawbacks: { ...after.drawbacks, changed: { ...after.drawbacks.changed, [p]: result.changed }, playedChanged },
+  };
+}
+
+// --- Tile values (Regicide, Decay, Goose Egg) --------------------------------
+
+const normalValue = (letter) => letterScores[letter] ?? 0;
+const valuesOf = (d, p) => d.values?.[p] ?? { rack: [], board: {} };
+
+// Each rack copy with its value for its holder.
+function rackTiles(rack, overrides) {
+  const pending = [...overrides];
+  return rack.map((letter) => {
+    const i = pending.findIndex(o => o.letter === letter);
+    return { letter, value: i === -1 ? normalValue(letter) : pending.splice(i, 1)[0].value };
+  });
+}
+const overridesOf = (tiles) => tiles.filter(t => t.value !== normalValue(t.letter)).map(t => ({ letter: t.letter, value: t.value }));
+
+// The used letters leave the rack: a play uses each letter's highest-valued
+// copy, an exchange sends the lowest.
+function takeTiles(tiles, letters, highest) {
+  const left = [...tiles];
+  const taken = [];
+  for (const letter of letters) {
+    let best = -1;
+    left.forEach((t, i) => {
+      if (t.letter === letter && (best === -1 || (highest ? t.value > left[best].value : t.value < left[best].value))) best = i;
+    });
+    if (best !== -1) taken.push(left.splice(best, 1)[0]);
+  }
+  return { left, taken };
+}
+
+function withValues(state, p, patch) {
+  const d = state.drawbacks;
+  return { ...state, drawbacks: { ...d, values: { ...d.values, [p]: { ...valuesOf(d, p), ...patch } } } };
+}
+
+// After every move: the mover's rack values follow their tiles (played ones
+// keep their value on the board, Decay's for everyone; exchanged ones get
+// their normal value back, except Regicide's), Regicide tiles in the bag are
+// followed, and Decay takes a point off every tile its holder kept.
+export function changeValues(before, after) {
+  const entry = after.history[after.history.length - 1];
+  if (!entry || entry.stepIn || !['play', 'exchange', 'pass'].includes(entry.type)) return after;
+  const m = entry.player;
+  const used = entry.type === 'play' ? entry.placed.map(t => (t.isBlank ? '?' : t.letter)) : (entry.exchanged ?? []);
+  const keptLetters = removeTilesByCount(before.racks[m], used);
+  const drawnLetters = removeTilesByCount(after.racks[m], keptLetters);
+  const pushed = entry.type === 'exchange' ? used.length : 0;
+
+  // Regicide tiles in the bag: drawn by this move (front of the bag), or
+  // pushed further from the end by the tiles exchanged behind them.
+  let next = after;
+  const regicideBag = [];
+  const zeroDraws = [];
+  for (const mark of after.drawbacks.regicideBag ?? []) {
+    if (before.bag.length - 1 - mark.fromEnd < drawnLetters.length) {
+      // Drawn: still 0 for its holder; anyone else just has a normal tile.
+      if (mark.holder === m) zeroDraws.push(mark.letter);
+    } else {
+      regicideBag.push({ ...mark, fromEnd: mark.fromEnd + pushed });
+    }
+  }
+
+  const id = after.drawbacks.ids[m];
+  if (VALUED.has(id)) {
+    const { left: kept, taken } = takeTiles(rackTiles(before.racks[m], valuesOf(after.drawbacks, m).rack), used, entry.type === 'play');
+    if (entry.type === 'play') {
+      const pending = [...taken];
+      for (const t of entry.placed) {
+        const i = pending.findIndex(x => x.letter === (t.isBlank ? '?' : t.letter));
+        if (i === -1) continue;
+        const { letter, value } = pending.splice(i, 1)[0];
+        if (value === normalValue(letter) || t.isBlank) continue;
+        for (const p of id === DECAY ? [1, 2] : [m]) {
+          next = withValues(next, p, { board: { ...valuesOf(next.drawbacks, p).board, [`${t.row},${t.col}`]: value } });
+        }
+      }
+    }
+    if (entry.type === 'exchange' && id === REGICIDE) {
+      const slots = [...used];
+      for (const t of taken) {
+        if (t.value === normalValue(t.letter)) continue;
+        const i = slots.lastIndexOf(t.letter);
+        slots[i] = null;
+        regicideBag.push({ holder: m, letter: t.letter, fromEnd: pushed - 1 - i });
+      }
+    }
+    const keptNow = id === DECAY && !after.ended ? kept.map(t => ({ ...t, value: Math.max(0, t.value - 1) })) : kept;
+    const drawn = drawnLetters.map((letter) => {
+      const i = zeroDraws.indexOf(letter);
+      if (i === -1) return { letter, value: normalValue(letter) };
+      zeroDraws.splice(i, 1);
+      return { letter, value: 0 };
+    });
+    next = withValues(next, m, { rack: overridesOf([...keptNow, ...drawn]) });
+  }
+  return { ...next, drawbacks: { ...next.drawbacks, regicideBag } };
+}
+
+// At the start of a turn: Regicide zeroes the holder's highest-valued tile,
+// Goose Egg 2 more random ones. Runs once per turn.
+export function startTurnValues(state) {
+  const d = state.drawbacks;
+  const p = state.currentPlayer;
+  const id = d.ids[p];
+  if (state.ended || (id !== REGICIDE && id !== GOOSE_EGG) || d.valueTurn === state.history.length) return state;
+  const tiles = rackTiles(state.racks[p], valuesOf(d, p).rack);
+  const live = tiles.map((t, i) => i).filter(i => tiles[i].value > 0);
+  let zero = [];
+  if (id === REGICIDE && live.length) {
+    zero = [live.reduce((best, i) => (tiles[i].value > tiles[best].value ? i : best), live[0])];
+  }
+  if (id === GOOSE_EGG) {
+    for (let i = live.length - 1; i > 0; i--) {
+      const j = randomInt(i + 1);
+      [live[i], live[j]] = [live[j], live[i]];
+    }
+    zero = live.slice(0, GOOSE_EGGS);
+  }
+  for (const i of zero) tiles[i] = { ...tiles[i], value: 0 };
+  const next = withValues(state, p, { rack: overridesOf(tiles) });
+  return { ...next, drawbacks: { ...next.drawbacks, valueTurn: state.history.length } };
+}
+
+// What the player's tiles are worth, for Go to rescore every play with.
+function valuesRequest(state, player) {
+  const v = valuesOf(state.drawbacks, player);
+  const board = Object.entries(v.board).map(([key, value]) => [...key.split(',').map(Number), value]);
+  if (!VALUED.has(state.drawbacks.ids[player]) && board.length === 0) return {};
+  return {
+    rackValues: rackTiles(state.racks[player], v.rack),
+    boardValues: board.length ? board : undefined,
   };
 }
 
@@ -285,6 +436,7 @@ function movesRequest(state, player, extra = {}) {
     flavor: roll.flavor,
     highlighted: roll.highlighted,
     mustObeyDevil: d.ids[player] === DEVIL && devilTurnsLeft(state.history, player) === 0,
+    ...valuesRequest(state, player),
     ...extra,
   };
 }
@@ -402,7 +554,7 @@ export async function runDrawbackBotTurn(state) {
       // Presence) would give it away, so his board shows the normal score
       // until the game ends.
       const hidden = (move.fullScore ?? move.score) - scored.score;
-      if (hidden > 0) {
+      if (hidden > 0 && HIDDEN_SCORE_CUTS.has(d.ids[2])) {
         const wallyHiddenPoints = d.wallyHiddenPoints + hidden;
         const history = [...next.history];
         history[history.length - 1] = { ...history[history.length - 1], hiddenAfter: wallyHiddenPoints };
@@ -431,7 +583,7 @@ const lossFrom = (losses) => {
 // six-pass. One breaker loses (scored 0); two at once cancel out.
 export async function afterDrawbackMove(before, after) {
   if (after.mode !== 'drawbacks') return after;
-  let next = changeLetters(before, after);
+  let next = changeValues(before, changeLetters(before, after));
   const entry = next.history[next.history.length - 1];
   if (entry?.type === 'play' && !entry.stepIn) {
     next = { ...next, drawbacks: { ...next.drawbacks, boardBeforeLastPlay: buildBoardForRequest(before.board, before.blankTiles) } };
@@ -469,7 +621,7 @@ export async function afterDrawbackMove(before, after) {
   }
 
   if (next.stepInPending && !next.ended) next = await stepIn(next);
-  return next;
+  return startTurnValues(next);
 }
 
 // Wally steps in: neither drawback could open, and six scoreless turns
