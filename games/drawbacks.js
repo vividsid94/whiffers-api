@@ -593,8 +593,9 @@ export async function afterDrawbackMove(before, after) {
 
   if (entry && entry.type !== 'resign' && !entry.stepIn && !d.loss) {
     let loss = null;
-    // Minefield: whoever places a tile in a zone loses, holder or not.
-    if (entry.type === 'play' && entry.placed.some(t => d.zones.some(z => t.row >= z.row && t.row < z.row + 3 && t.col >= z.col && t.col < z.col + 3))) {
+    // Minefield: the holder loses for placing a tile in their own zone
+    // (the opponent can play there safely).
+    if (entry.type === 'play' && entry.placed.some(t => d.zones.some(z => z.holder === entry.player && t.row >= z.row && t.row < z.row + 3 && t.col >= z.col && t.col < z.col + 3))) {
       loss = { player: entry.player, reason: 'Minefield: played inside the zone' };
     }
     if (!loss) {
