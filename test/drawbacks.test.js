@@ -205,3 +205,26 @@ test('drawbacks: Demotion drops your kept tiles after a pass and shows what they
     server.close();
   }
 });
+
+test('drawbacks: Regicide zeroes your highest tile, and the play is scored with it', { skip: skipGo }, async () => {
+  const { base, server } = await startServer();
+  try {
+    const values = { A: 1, B: 3, C: 3, D: 2, E: 1, F: 4, G: 2, H: 4, I: 1, J: 8, K: 5, L: 1, M: 3, N: 1, O: 1, P: 3, Q: 10, R: 1, S: 1, T: 1, U: 1, V: 4, W: 4, X: 8, Y: 4, Z: 10, '?': 0 };
+    const game = await humanFirstGame(base, { player: 51, wally: 1 });
+    const zeroed = game.state.drawbacks.values.rack;
+    assert.equal(zeroed.length, 1);
+    assert.equal(zeroed[0].value, 0);
+    assert.equal(values[zeroed[0].letter], Math.max(...game.state.myRack.map(l => values[l])));
+    const best = await bestMove(game.state);
+    if (!best) return;
+    const ok = await move(base, game, game.state, 'play', { tiles: placedOf(best), deferBot: true });
+    assert.equal(ok.status, 200, JSON.stringify(ok.body));
+    const entry = ok.body.afterHuman.history[0];
+    const usesZeroed = placedOf(best).filter(t => !t.isBlank && t.letter === zeroed[0].letter).length
+      > game.state.myRack.filter(l => l === zeroed[0].letter).length - 1;
+    if (usesZeroed) assert.ok(entry.score < best.score, `${entry.score} vs normal ${best.score}`);
+    else assert.equal(entry.score, best.score);
+  } finally {
+    server.close();
+  }
+});
