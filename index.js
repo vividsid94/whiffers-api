@@ -7,7 +7,9 @@ import { fileURLToPath } from 'url';
 import { parse } from 'csv-parse/sync';
 import rateLimit from 'express-rate-limit';
 import { buildBoardForRequest, GO_SERVICE_URL } from './rules/boardRequest.js';
-import { createGamesRouter } from './games/routes.js';
+import { createGamesRouter, isAllowedOrigin } from './games/routes.js';
+import { createMultiplayer } from './mp/routes.js';
+import { createPgStore, ensureMultiplayerSchema } from './mp/store.js';
 import { ensureGamesSchema, cleanupGames } from './games/repo.js';
 import { preloadDictionaries } from './games/dictionary.js';
 import { createAuth } from './auth/auth.js';
@@ -147,7 +149,7 @@ else console.warn('BETTER_AUTH_SECRET not set - accounts are off');
 // /games has its own CORS allowlist, body limit and rate limits
 // (games/routes.js), and the account routes have theirs (above); everything
 // else keeps the open, read-mostly setup.
-const notGames = (middleware) => (req, res, next) => (req.path.startsWith('/games') || isAuthPath(req.path) ? next() : middleware(req, res, next));
+const notGames = (middleware) => (req, res, next) => (req.path.startsWith('/games') || req.path.startsWith('/mp') || isAuthPath(req.path) ? next() : middleware(req, res, next));
 app.use(notGames(cors()));
 // POST /registry carries a GCG transcript - a 1MB cap is generous headroom
 // (real games top out well under 100KB) while still bounding request size.
@@ -161,6 +163,9 @@ app.use('/admin', adminLimiter);
 app.post('/registry', adminLimiter);
 
 app.use('/games', createGamesRouter(pool));
+// Multiplayer (mp/, MULTIPLAYER_PLAN.md): its own CORS and body parsing.
+const multiplayer = createMultiplayer({ store: createPgStore(pool), auth, isAllowedOrigin });
+app.use('/mp', multiplayer.router);
 
 async function fetchJson(url) {
   const res = await fetch(url);
@@ -1308,4 +1313,6 @@ const runGameCleanup = () => cleanupGames(pool)
   .catch((err) => console.error('Game cleanup failed:', err.message));
 runGameCleanup();
 setInterval(runGameCleanup, 24 * 60 * 60 * 1000).unref();
-app.listen(PORT, () => console.log(`cross-tables-api listening on :${PORT}`));
+try { await ensureMultiplayerSchema(pool); await multiplayer.resumeTimers(); } catch (err) { console.error('Multiplayer setup failed:', err.message); }
+const server = app.listen(PORT, () => console.log(`cross-tables-api listening on :${PORT}`));
+multiplayer.attachSockets(server);

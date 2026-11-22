@@ -19,6 +19,8 @@
 //   rolls: { [turnIndex]: { quota?, blocked? } }   rolled for whoever moves then
 //   loss: null | { player, reason } | { both: true, reason }
 //   wallyHiddenPoints,             Nerf War points Wally's board hides until the end
+//   hiddenPoints: { 1, 2 }         multiplayer: the same, for either player (hidden
+//                                  from their opponent until the end)
 //   boardBeforeLastPlay,           for I'll Take That
 //   turnInfo: { turnIndex, playableCount, canExchange, forced, opened } (the human's turn)
 //   changed: { 1: [{ now, was }], 2: [...] }  Demotion / Unusual: rack tiles that
@@ -73,8 +75,9 @@ const DECAY = 52;
 const GOOSE_EGG = 64;
 const GOOSE_EGGS = 2;
 const VALUED = new Set([REGICIDE, DECAY, GOOSE_EGG]);
-// Drawbacks whose score cut would give Wally's drawback away - his board
-// shows normal scores until the game ends.
+// Drawbacks whose score cut would give the drawback away - the holder's
+// board shows normal scores to their opponent until the game ends (Wally in
+// bot games, either player in multiplayer).
 const HIDDEN_SCORE_CUTS = new Set([17, 48, 55, REGICIDE, DECAY, GOOSE_EGG]);
 // Demotion: each letter drops to the next in its chain (the last stays put),
 // a blank drops to S. Same as drawbacks.go demotionChains - keep in step.
@@ -135,6 +138,7 @@ export function createDrawbackState(picks = {}) {
     rolls: {},
     loss: null,
     wallyHiddenPoints: 0,
+    hiddenPoints: { 1: 0, 2: 0 },
     boardBeforeLastPlay: null,
     turnInfo: null,
   };
@@ -478,25 +482,27 @@ function ghostly(state, player, move) {
 // many plays fit, whether exchanging is allowed, whether a "must" bites,
 // I'll Take That's opened squares). Never throws - a Go hiccup just leaves
 // the panel without it.
-export async function prepareHumanTurn(state) {
-  if (state.mode !== 'drawbacks' || state.ended || state.currentPlayer !== 1) return state;
+// `player`: the person to move (1 in bot games; either seat in multiplayer).
+export async function prepareHumanTurn(state, player = 1) {
+  if (state.mode !== 'drawbacks' || state.ended || state.currentPlayer !== player) return state;
   const next = ensureRolls(state);
   try {
-    const info = await postGo('/drawback-moves', movesRequest(next, 1, { limit: 0 }));
+    const info = await postGo('/drawback-moves', movesRequest(next, player, { limit: 0 }));
     return {
       ...next,
       drawbacks: {
         ...next.drawbacks,
         turnInfo: {
+          player,
           turnIndex: next.history.length,
           playableCount: info.playableCount,
           canExchange: info.canExchange,
           forced: info.forced ?? null,
           opened: info.opened ?? [],
-          ...(next.drawbacks.ids[1] === RESTLESSNESS && info.timers ? { timers: info.timers } : {}),
-          ...(next.drawbacks.ids[1] === DEVIL && info.devil ? {
+          ...(next.drawbacks.ids[player] === RESTLESSNESS && info.timers ? { timers: info.timers } : {}),
+          ...(next.drawbacks.ids[player] === DEVIL && info.devil ? {
             devil: { word: info.devil.word, startPosition: info.devil.startPosition, score: info.devil.score, tiles: info.devil.tiles.filter(t => t.isNew) },
-            devilTurnsLeft: devilTurnsLeft(next.history, 1),
+            devilTurnsLeft: devilTurnsLeft(next.history, player),
           } : {}),
         },
       },
@@ -509,29 +515,48 @@ export async function prepareHumanTurn(state) {
 
 // The human's word play: the engine's own checks first (rack, placement,
 // dictionary), then the drawback. Throws MoveError when either refuses.
-export async function applyHumanDrawbackPlay(state, tiles, isValidWord) {
-  applyHumanPlay(state, tiles, isValidWord); // throws on an illegal play
+export async function applyHumanDrawbackPlay(state, tiles, isValidWord, player = 1) {
+  applyHumanPlay(state, tiles, isValidWord, { player }); // throws on an illegal play
   const ready = ensureRolls(state);
-  const judged = await postGo('/drawback-moves', movesRequest(ready, 1, {
+  const judged = await postGo('/drawback-moves', movesRequest(ready, player, {
     proposed: tiles.map(t => ({ row: t.row, col: t.col, letter: t.letter, isBlank: !!t.isBlank })),
   }));
   if (!judged.proposedAllowed || !judged.proposed) {
     throw new MoveError('invalid_move', judged.proposedReason || "Your drawback doesn't allow that move");
   }
-  const scored = ghostly(ready, 1, judged.proposed);
+  const scored = ghostly(ready, player, judged.proposed);
   if (judged.devil && placedKey(judged.devil.tiles) === placedKey(judged.proposed.tiles)) scored.extra.obeyedDevil = true;
-  return applyHumanPlay(ready, tiles, isValidWord, scored);
+  const next = applyHumanPlay(ready, tiles, isValidWord, { ...scored, player });
+  // Only multiplayer hides a person's score cut (from the other person).
+  return ready.multiplayer ? hideScoreCut(next, player, judged.proposed, scored) : next;
 }
 
-export async function applyHumanDrawbackExchange(state, letters) {
+export async function applyHumanDrawbackExchange(state, letters, player = 1) {
   const ready = ensureRolls(state);
   if (ready.bag.length >= 7) {
-    const judged = await postGo('/drawback-moves', movesRequest(ready, 1, { proposedExchange: letters.join('') }));
+    const judged = await postGo('/drawback-moves', movesRequest(ready, player, { proposedExchange: letters.join('') }));
     if (!judged.proposedAllowed) {
       throw new MoveError('invalid_move', judged.proposedReason || "Your drawback doesn't allow that exchange");
     }
   }
-  return applyExchange(ready, 1, letters);
+  return applyExchange(ready, player, letters);
+}
+
+// A score cut that would give the player's drawback away (HIDDEN_SCORE_CUTS)
+// is kept from their opponent until the game ends: the points go on
+// hiddenPoints[player] (and wallyHiddenPoints for Wally), and the history
+// entry records the running hidden total (hiddenAfter) for view.js.
+export function hideScoreCut(next, player, move, scored) {
+  const d = next.drawbacks;
+  const hidden = (move.fullScore ?? move.score) - scored.score;
+  if (hidden <= 0 || !HIDDEN_SCORE_CUTS.has(d.ids[player])) return next;
+  const isWally = !next.multiplayer && player === 2;
+  const hiddenPoints = { 1: 0, 2: 0, ...d.hiddenPoints };
+  hiddenPoints[player] += hidden;
+  const wallyHiddenPoints = isWally ? d.wallyHiddenPoints + hidden : d.wallyHiddenPoints;
+  const history = [...next.history];
+  history[history.length - 1] = { ...history[history.length - 1], hiddenAfter: isWally ? wallyHiddenPoints : hiddenPoints[player] };
+  return { ...next, history, drawbacks: { ...d, hiddenPoints, wallyHiddenPoints } };
 }
 
 // --- The bot's turn ---------------------------------------------------------
@@ -549,18 +574,10 @@ export async function runDrawbackBotTurn(state) {
       if (move.isExchange) return applyExchange(ready, 2, move.exchangeTiles.split(''));
       const scored = ghostly(ready, 2, move);
       if (data.devil && placedKey(data.devil.tiles) === placedKey(move.tiles)) scored.extra.obeyedDevil = true;
-      let next = applyBotMove(ready, move, scored);
       // A drawback that cuts his score (Nerf War, Can I Buy a Vowel, Ghostly
       // Presence) would give it away, so his board shows the normal score
       // until the game ends.
-      const hidden = (move.fullScore ?? move.score) - scored.score;
-      if (hidden > 0 && HIDDEN_SCORE_CUTS.has(d.ids[2])) {
-        const wallyHiddenPoints = d.wallyHiddenPoints + hidden;
-        const history = [...next.history];
-        history[history.length - 1] = { ...history[history.length - 1], hiddenAfter: wallyHiddenPoints };
-        next = { ...next, history, drawbacks: { ...next.drawbacks, wallyHiddenPoints } };
-      }
-      return next;
+      return hideScoreCut(applyBotMove(ready, move, scored), 2, move, scored);
     } catch (err) {
       if (!(err instanceof MoveError)) throw err;
       console.error('Drawback bot candidate rejected by engine:', err.reason);

@@ -47,7 +47,7 @@ const MOVE_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 // ALLOWED_ORIGINS (comma-separated) adds more. CORS isn't the lock - the
 // token is - it just keeps other sites from driving games in a visitor's tab.
 const extraOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-function isAllowedOrigin(origin) {
+export function isAllowedOrigin(origin) {
   if (!origin) return true; // same-origin, curl, server-to-server
   if (extraOrigins.includes(origin)) return true;
   return /^https:\/\/(www\.)?(whiffers230|tileturnover)\.com$/.test(origin)

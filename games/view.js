@@ -1,92 +1,141 @@
 // The ONLY path from a stored game state to what the browser receives.
 // Anything not copied here never leaves the server: the bag's order, the
-// bot's rack, and - until the game ends - what the bot held or exchanged on
-// each turn. Unseen tiles are sent as one sorted multiset (bag + bot rack
-// together), which is public information in Scrabble anyway.
+// opponent's rack, and - until the game ends - what the opponent held or
+// exchanged on each turn. Unseen tiles are sent as one sorted multiset (bag +
+// opponent's rack together), which is public information in Scrabble anyway.
+//
+// Seats (MULTIPLAYER_PLAN.md): the snapshot is always from one seat's side
+// (opts.seat, 1 by default - the human in a bot game). Everything is turned
+// round so that "player 1" in the snapshot is the viewer and "player 2" their
+// opponent - scores, turn, history, winner, Drawbacks - so the frontend's
+// game screen (which always shows player 1 as "you") works for both people
+// in a multiplayer game without knowing which seat it's in.
 
 import { alphabetizeRack } from '../rules/rack.js';
 
-// opts.peek (Drawbacks): reveal Wally's drawback mid-game.
+// opts.seat: whose side to show (1 or 2). opts.peek (Drawbacks): reveal the
+// opponent's drawback mid-game (bot games' Testing peek).
 export function toClientSnapshot(gameId, version, state, opts = {}) {
+  const me = opts.seat === 2 ? 2 : 1;
+  const opp = me === 1 ? 2 : 1;
+  const view = (p) => (p === me ? 1 : 2); // a stored seat -> the viewer's numbering
   const reveal = state.ended;
-  // Drawbacks + Nerf War: until the game ends, Wally's board shows his
-  // normal score; the real one is revealed at game over.
-  const hidden = !reveal ? (state.drawbacks?.wallyHiddenPoints ?? 0) : 0;
+  // Drawbacks: until the game ends, a score cut that would give the
+  // opponent's drawback away stays hidden (their board shows the normal
+  // score); the real one is revealed at game over.
+  const hidden = !reveal ? hiddenPointsOf(state, opp) : 0;
   return {
     gameId,
     version,
+    seat: me,
+    multiplayer: !!state.multiplayer,
     mode: state.mode,
     dailyDate: state.dailyDate,
     lexicon: state.lexicon,
     opponentId: state.opponentId,
     board: state.board,
     blankTiles: state.blankTiles,
-    myRack: state.racks[1],
-    scores: { player1: state.scores[1], player2: state.scores[2] + hidden },
-    currentPlayer: state.currentPlayer,
-    botPending: !state.ended && state.currentPlayer === 2,
+    myRack: state.racks[me],
+    scores: { player1: state.scores[me], player2: state.scores[opp] + hidden },
+    currentPlayer: view(state.currentPlayer),
+    botPending: !state.multiplayer && !state.ended && state.currentPlayer === 2,
     scorelessRun: state.scorelessRun,
     bagCount: state.bag.length,
-    opponentRackCount: state.racks[2].length,
-    unseen: alphabetizeRack([...state.bag, ...state.racks[2]]),
-    history: toClientHistory(state.history, reveal),
-    drawbacks: state.drawbacks ? toClientDrawbacks(state, reveal || !!opts.peek) : undefined,
+    opponentRackCount: state.racks[opp].length,
+    unseen: alphabetizeRack([...state.bag, ...state.racks[opp]]),
+    history: toClientHistory(state, me, reveal),
+    drawbacks: state.drawbacks ? toClientDrawbacks(state, me, reveal || !!opts.peek) : undefined,
     ended: state.ended,
     endReason: state.endReason,
-    final: state.ended ? { ...state.final, opponentRack: state.racks[2] } : null,
+    final: state.ended ? viewFinal(state.final, me, state.racks[opp]) : null,
     opponentMood: state.opponentMood,
   };
 }
 
-// Drawbacks: your own drawback and rolls, the panel's turn info, your
-// Minefield zone - and Wally's drawback and zone only once revealed.
-function toClientDrawbacks(state, revealWally) {
+// Points hidden from `player`'s opponent so far: Wally's in a bot game, the
+// player's own tally in multiplayer (drawbacks.js hideScoreCut).
+function hiddenPointsOf(state, player) {
   const d = state.drawbacks;
-  const turnIndex = state.history.length;
+  if (!d) return 0;
+  if (!state.multiplayer) return player === 2 ? (d.wallyHiddenPoints ?? 0) : 0;
+  return d.hiddenPoints?.[player] ?? 0;
+}
+
+// The final result from the viewer's side. Stored winner: 'player' = seat 1,
+// 'bot' = seat 2 (names from before multiplayer); shown: 'player' = you.
+function viewFinal(final, me, opponentRack) {
+  if (me === 1) return { ...final, opponentRack };
+  const swap = { player: 'bot', bot: 'player' };
   return {
-    mine: d.ids[1],
-    wally: revealWally ? d.ids[2] : null,
-    zones: d.zones.filter(z => z.holder === 1 || revealWally),
-    roll: state.currentPlayer === 1 && !state.ended ? (d.rolls[turnIndex] ?? null) : null,
-    turnInfo: d.turnInfo?.turnIndex === turnIndex && state.currentPlayer === 1 && !state.ended ? d.turnInfo : null,
-    loss: d.loss,
-    wallyHiddenPoints: state.ended ? d.wallyHiddenPoints : 0,
-    changed: d.changed?.[1] ?? [],
+    ...final,
+    player1Score: final.player2Score,
+    player2Score: final.player1Score,
+    winner: swap[final.winner] ?? final.winner,
+    opponentRack,
+  };
+}
+
+// Drawbacks: your own drawback and rolls, the panel's turn info, your
+// Minefield zone - and the opponent's drawback and zone only once revealed.
+// (Field names `wally`/`wallyHiddenPoints` mean "the opponent".)
+function toClientDrawbacks(state, me, revealOpponent) {
+  const d = state.drawbacks;
+  const opp = me === 1 ? 2 : 1;
+  const view = (p) => (p === me ? 1 : 2);
+  const turnIndex = state.history.length;
+  const myTurn = state.currentPlayer === me && !state.ended;
+  const turnInfoIsMine = d.turnInfo && (d.turnInfo.player ?? 1) === me;
+  return {
+    mine: d.ids[me],
+    wally: revealOpponent ? d.ids[opp] : null,
+    zones: d.zones.filter(z => z.holder === me || revealOpponent).map(z => ({ ...z, holder: view(z.holder) })),
+    roll: myTurn ? (d.rolls[turnIndex] ?? null) : null,
+    turnInfo: myTurn && turnInfoIsMine && d.turnInfo.turnIndex === turnIndex ? stripSeat(d.turnInfo) : null,
+    loss: d.loss ? { ...d.loss, ...(d.loss.player ? { player: view(d.loss.player) } : {}) } : null,
+    wallyHiddenPoints: state.ended ? hiddenPointsOf(state, opp) : 0,
+    changed: d.changed?.[me] ?? [],
     // Regicide / Decay / Goose Egg: what your tiles are worth to you, where
     // that isn't the normal value.
     values: {
-      rack: d.values?.[1]?.rack ?? [],
-      board: Object.entries(d.values?.[1]?.board ?? {}).map(([key, value]) => [...key.split(',').map(Number), value]),
+      rack: d.values?.[me]?.rack ?? [],
+      board: Object.entries(d.values?.[me]?.board ?? {}).map(([key, value]) => [...key.split(',').map(Number), value]),
     },
   };
 }
 
-// Nerf War: until the game ends, Wally's entries show his normal scores and
-// running totals (hiddenAfter: the points hidden so far, set on each of his
-// nerfed plays).
-function toClientHistory(history, reveal) {
+const stripSeat = ({ player: _seat, ...info }) => info;
+
+// Until the game ends, the opponent's entries show their normal scores and
+// running totals wherever a score cut is being hidden (hiddenAfter: the
+// points hidden so far, set on each such play).
+function toClientHistory(state, me, reveal) {
   let hiddenSoFar = 0;
-  return history.map((h) => {
-    if (h.player === 2 && h.hiddenAfter != null) hiddenSoFar = h.hiddenAfter;
-    return toClientHistoryEntry(h, reveal, h.player === 2 ? hiddenSoFar : 0);
+  return state.history.map((h) => {
+    const isOpp = h.player !== me;
+    if (isOpp && h.hiddenAfter != null) hiddenSoFar = h.hiddenAfter;
+    return toClientHistoryEntry(h, state, me, reveal, isOpp ? hiddenSoFar : 0);
   });
 }
 
-function toClientHistoryEntry(h, reveal, hiddenSoFar = 0) {
-  const nerfHidden = !reveal && h.player === 2 && h.fullScore != null && h.fullScore > h.score;
+function toClientHistoryEntry(h, state, me, reveal, hiddenSoFar = 0) {
+  const isOpp = h.player !== me;
+  // Bot games hide every cut on Wally's plays (as before multiplayer);
+  // multiplayer hides only the cuts drawbacks.js marked as hidden.
+  const cutHidden = !reveal && isOpp && h.fullScore != null && h.fullScore > h.score
+    && (state.multiplayer ? h.hiddenAfter != null : h.player === 2);
   const entry = {
-    player: h.player,
-    isBot: h.player === 2,
+    player: h.player === me ? 1 : 2,
+    isBot: !state.multiplayer && h.player === 2,
     type: h.type,
     placed: h.placed,
     words: h.words,
-    score: nerfHidden ? h.fullScore : h.score,
+    score: cutHidden ? h.fullScore : h.score,
     total: reveal ? h.total : h.total + hiddenSoFar,
     isBingo: !!h.isBingo,
   };
   if (h.stepIn) entry.stepIn = true;
   if (h.ghosted) entry.ghosted = true; // Ghostly Presence turned this play's score to 0
-  if (h.player === 1 || reveal) {
+  if (!isOpp || reveal) {
     if (h.rack !== undefined) entry.rack = h.rack;
     if (h.exchanged) entry.exchanged = h.exchanged;
   }

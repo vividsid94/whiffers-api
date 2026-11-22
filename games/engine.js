@@ -7,8 +7,10 @@
 // MoveError for anything the rules don't allow - the caller turns that into
 // a 422/409, never a partial write.
 //
-// Player 1 is always the human, player 2 the bot, matching the frontend's
-// gameStore. Rules mirror the frontend exactly (rules/ holds the copies):
+// In bot games player 1 is the human and player 2 the bot, matching the
+// frontend's gameStore. In multiplayer games (MULTIPLAYER_PLAN.md) both
+// seats are people: the human-move functions take a `player` (default 1),
+// and view.js shows each seat the game from its own side. Rules mirror the frontend exactly (rules/ holds the copies):
 // draws come off the front of the bag, exchanged tiles go to the back, a
 // play resets the scoreless run, a pass or 0-point exchange adds to it, six
 // in a row ends the game, and going out (rack + bag empty) ends it too.
@@ -111,10 +113,12 @@ function commitPlay(state, player, tiles, words, opts = {}) {
   return next;
 }
 
-// The human's word play. `isValidWord(word)` is the lexicon check (games/
-// dictionary.js), passed in so this stays pure and testable.
+// A person's word play. `isValidWord(word)` is the lexicon check (games/
+// dictionary.js), passed in so this stays pure and testable. opts.player:
+// which seat is playing (1 unless it's a multiplayer game's seat 2).
 export function applyHumanPlay(state, tiles, isValidWord, opts = {}) {
-  assertTurn(state, 1);
+  const player = opts.player ?? 1;
+  assertTurn(state, player);
   if (!Array.isArray(tiles) || tiles.length < 1 || tiles.length > 7) {
     throw new MoveError('invalid_move', 'Place between 1 and 7 tiles');
   }
@@ -125,7 +129,7 @@ export function applyHumanPlay(state, tiles, isValidWord, opts = {}) {
     seen.add(key);
     if (isLetter(state.board[t.row][t.col])) throw new MoveError('invalid_move', 'That square is taken');
   }
-  if (!rackHasTiles(state.racks[1], tiles.map(t => (t.isBlank ? '?' : t.letter)))) {
+  if (!rackHasTiles(state.racks[player], tiles.map(t => (t.isBlank ? '?' : t.letter)))) {
     throw new MoveError('invalid_move', "Those tiles aren't on your rack");
   }
 
@@ -144,7 +148,7 @@ export function applyHumanPlay(state, tiles, isValidWord, opts = {}) {
     );
   }
 
-  return commitPlay(state, 1, tiles, placement.words, opts);
+  return commitPlay(state, player, tiles, placement.words, opts);
 }
 
 // letters: the tiles to swap ('?' for a blank). Needs 7+ in the bag.
@@ -238,11 +242,12 @@ export function applyBotMove(state, move, opts = {}) {
   return commitPlay(state, 2, tiles, placement.words, opts);
 }
 
-// The human resigns: the game ends now and the bot wins.
-export function applyResign(state) {
+// `player` resigns (the human in a bot game): the game ends now and the
+// other side wins.
+export function applyResign(state, player = 1) {
   if (state.ended) throw new MoveError('game_over', 'The game is over');
   const next = clone(state);
-  next.history.push({ player: 1, type: 'resign', placed: [], words: [], score: 0, total: next.scores[1] });
+  next.history.push({ player, type: 'resign', placed: [], words: [], score: 0, total: next.scores[player] });
   return finalize(next, 'resigned');
 }
 
@@ -275,7 +280,9 @@ function finalize(next, endReason) {
   next.ended = true;
   next.endReason = endReason;
   if (endReason === 'resigned') {
-    next.final = { player1Score: next.scores[1], player2Score: next.scores[2], winner: 'bot' };
+    // winner: 'player' = seat 1, 'bot' = seat 2 (the names predate multiplayer).
+    const resigner = next.history[next.history.length - 1]?.player ?? 1;
+    next.final = { player1Score: next.scores[1], player2Score: next.scores[2], winner: resigner === 1 ? 'bot' : 'player' };
     return next;
   }
   const { finalPlayer1Score, finalPlayer2Score } = computeFinalScores({
