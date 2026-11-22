@@ -43,14 +43,15 @@ const OPPONENT_IDS = OPPONENTS.map(o => o.id);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MOVE_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
-// The live site, Railway-hosted builds (staging) and local dev by default;
-// ALLOWED_ORIGINS (comma-separated) adds more. CORS isn't the lock - the
-// token is - it just keeps other sites from driving games in a visitor's tab.
+// The live site and its subdomains (www., staging.), Railway-hosted builds
+// and local dev by default; ALLOWED_ORIGINS (comma-separated) adds more. CORS
+// isn't the lock - the token is - it just keeps other sites from driving games
+// in a visitor's tab.
 const extraOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 export function isAllowedOrigin(origin) {
   if (!origin) return true; // same-origin, curl, server-to-server
   if (extraOrigins.includes(origin)) return true;
-  return /^https:\/\/(www\.)?(whiffers230|tileturnover)\.com$/.test(origin)
+  return /^https:\/\/([a-z0-9-]+\.)?(whiffers230|tileturnover)\.com$/.test(origin)
     || /^https:\/\/[a-z0-9-]+\.up\.railway\.app$/.test(origin)
     || /^http:\/\/localhost:\d+$/.test(origin);
 }
