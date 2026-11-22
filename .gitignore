@@ -1,3 +1,6 @@
 node_modules/
 *.log
 .env
+
+# Local dev data (PGlite accounts database)
+.local/

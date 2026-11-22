@@ -12,10 +12,15 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "better-auth": "1.7.18",
     "cors": "^2.8.6",
     "csv-parse": "^7.0.2",
     "express": "^5.2.1",
     "express-rate-limit": "^7.5.1",
     "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.15",
+    "kysely-pglite-dialect": "1.4.0"
   }
 }

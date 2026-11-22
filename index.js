@@ -10,6 +10,8 @@ import { buildBoardForRequest, GO_SERVICE_URL } from './rules/boardRequest.js';
 import { createGamesRouter } from './games/routes.js';
 import { ensureGamesSchema, cleanupGames } from './games/repo.js';
 import { preloadDictionaries } from './games/dictionary.js';
+import { createAuth } from './auth/auth.js';
+import { mountAuth, isAuthPath, ensureAuthSchema } from './auth/mount.js';
 
 const PORT = process.env.PORT || 4000;
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -135,9 +137,17 @@ const app = express();
 // comes from the proxy and per-IP rate limits would lump all visitors together.
 app.set('trust proxy', 1);
 
+// Accounts (auth/): Better Auth's routes under /api/auth plus /me, with their
+// own credentialed CORS. Off until BETTER_AUTH_SECRET is set, so deploying
+// this before the Railway variables exist doesn't break anything.
+const auth = process.env.BETTER_AUTH_SECRET ? createAuth({ database: pool }) : null;
+if (auth) mountAuth(app, auth);
+else console.warn('BETTER_AUTH_SECRET not set - accounts are off');
+
 // /games has its own CORS allowlist, body limit and rate limits
-// (games/routes.js); everything else keeps the open, read-mostly setup.
-const notGames = (middleware) => (req, res, next) => (req.path.startsWith('/games') ? next() : middleware(req, res, next));
+// (games/routes.js), and the account routes have theirs (above); everything
+// else keeps the open, read-mostly setup.
+const notGames = (middleware) => (req, res, next) => (req.path.startsWith('/games') || isAuthPath(req.path) ? next() : middleware(req, res, next));
 app.use(notGames(cors()));
 // POST /registry carries a GCG transcript - a 1MB cap is generous headroom
 // (real games top out well under 100KB) while still bounding request size.
@@ -1287,6 +1297,9 @@ app.get('/monster-puzzle/:id', async (req, res) => {
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 await ensureSchema();
+if (auth) {
+  try { await ensureAuthSchema(auth); } catch (err) { console.error('Auth schema check failed:', err.message); }
+}
 // Load both word lists now so a game's first move doesn't pay the read.
 preloadDictionaries();
 // Drop finished/abandoned games daily (one instance, so a timer is enough).
