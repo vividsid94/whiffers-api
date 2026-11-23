@@ -26,6 +26,7 @@ const { mountAuth, ensureAuthSchema } = await import('../auth/mount.js');
 const { createMultiplayer } = await import('../mp/routes.js');
 const { createMemoryStore } = await import('../mp/store.js');
 const { isAllowedOrigin } = await import('../games/routes.js');
+const { createMemoryArchive } = await import('../games/archive.js');
 
 const dataDir = fileURLToPath(new URL('../.local/pglite', import.meta.url));
 mkdirSync(dataDir, { recursive: true });
@@ -35,10 +36,12 @@ await ensureAuthSchema(auth);
 
 const PORT = Number(process.env.PORT) || 4000;
 const app = express();
-mountAuth(app, auth);
-app.use('/games', createGamesRouter(createFakePool()));
+// Saved games in memory: kept as long as this process.
+const archive = createMemoryArchive();
+mountAuth(app, auth, process.env, { archive });
+app.use('/games', createGamesRouter(createFakePool(), { auth, archive }));
 // Multiplayer (mp/) on an in-memory store: games last as long as this process.
-const multiplayer = createMultiplayer({ store: createMemoryStore(), auth, isAllowedOrigin });
+const multiplayer = createMultiplayer({ store: createMemoryStore(), auth, isAllowedOrigin, archive });
 app.use('/mp', multiplayer.router);
 const server = app.listen(PORT, () => console.log(`local games + accounts + multiplayer server on :${PORT}`));
 multiplayer.attachSockets(server);

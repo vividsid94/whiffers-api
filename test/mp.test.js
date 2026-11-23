@@ -21,7 +21,7 @@ async function startServer() {
   let t = Date.now();
   const now = () => t;
   const store = createMemoryStore();
-  const mp = createMultiplayer({ store, auth: null, isAllowedOrigin: () => true, now });
+  const mp = createMultiplayer({ store, auth: null, isAllowedOrigin: () => true, now, rateLimits: false });
   const app = express();
   app.use('/mp', mp.router);
   const server = await new Promise((resolve) => { const s = app.listen(0, () => resolve(s)); });

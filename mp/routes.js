@@ -33,6 +33,7 @@ import {
 } from './game.js';
 import { flagTime } from './clock.js';
 import { createHub } from './hub.js';
+import { saveFinished, GUEST_NAME } from '../games/archive.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CODE_RE = /^[A-Z0-9]{8}$/;
@@ -74,9 +75,12 @@ function moveIdOf(body) {
  * @param {object} opts.store            mp/store.js store
  * @param {object|null} opts.auth        Better Auth instance, or null (guests only)
  * @param {(origin) => boolean} opts.isAllowedOrigin  which sites may use this API
+ * @param {object|null} [opts.archive]  where finished games with a signed-in player are saved (games/archive.js)
  * @param {() => number} [opts.now]
  */
-export function createMultiplayer({ store, auth, isAllowedOrigin, now = Date.now }) {
+// rateLimits: false turns the per-address limits off (tests that play whole
+// games quickly from one address).
+export function createMultiplayer({ store, auth, isAllowedOrigin, archive = null, now = Date.now, rateLimits = true }) {
   const router = express.Router();
   const hub = createHub({ store, auth, isAllowedOrigin, now });
   const timers = new Map();
@@ -118,7 +122,27 @@ export function createMultiplayer({ store, auth, isAllowedOrigin, now = Date.now
     const saved = { ...game, version };
     schedule(saved);
     hub.broadcast(saved);
+    if (saved.status === 'ended') archiveGame(saved);
     return saved;
+  }
+
+  // A finished game with at least one signed-in player is saved to each
+  // signed-in player's account. Guests are always stored as "Guest", never
+  // the name they typed. Saving the same game again (e.g. when a rematch is
+  // asked for) is a no-op.
+  function archiveGame(game) {
+    const seat = (s) => (s ? { userId: s.userId ?? null, name: s.guest ? GUEST_NAME : s.name, guest: !!s.guest, botId: null } : null);
+    saveFinished(archive, {
+      id: game.id,
+      source: 'mp',
+      mode: game.settings.mode === 'drawbacks' ? 'drawbacks' : 'classic',
+      lexicon: game.settings.lexicon,
+      dailyDate: null,
+      seats: { 1: seat(game.seats[1]), 2: seat(game.seats[2]) },
+      settings: game.settings,
+      state: game.state,
+      endedAt: now(),
+    });
   }
 
   // Re-arms timeouts after a restart (and ends any game that ran out while
@@ -181,9 +205,10 @@ export function createMultiplayer({ store, auth, isAllowedOrigin, now = Date.now
     });
   }));
   router.use(express.json({ limit: '16kb' }));
-  const createLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 30, standardHeaders: 'draft-7', legacyHeaders: false });
-  const joinLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false });
-  const moveLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false });
+  const limiter = (windowMs, limit) => (rateLimits ? rateLimit({ windowMs, limit, standardHeaders: 'draft-7', legacyHeaders: false }) : (req, res, next) => next());
+  const createLimiter = limiter(60 * 60 * 1000, 30);
+  const joinLimiter = limiter(60 * 60 * 1000, 60);
+  const moveLimiter = limiter(60 * 1000, 120);
 
   // --- Invites ----------------------------------------------------------------
 

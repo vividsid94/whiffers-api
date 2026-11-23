@@ -11,11 +11,11 @@ export function createFakePool() {
     async query(sql, params = []) {
       const s = sql.replace(/\s+/g, ' ').trim();
       if (s.startsWith('INSERT INTO games')) {
-        const [id, tokenHash, mode, lexicon, opponentId, dailyDate, engineVersion, state] = params;
+        const [id, tokenHash, mode, lexicon, opponentId, dailyDate, engineVersion, state, userId = null, userName = null] = params;
         rows.set(id, {
           id, token_hash: tokenHash, mode, lexicon, opponent_id: opponentId, daily_date: dailyDate,
           engine_version: engineVersion, state: jsonClone(state), version: 0, status: 'active',
-          last_client_move_id: null, last_response: null,
+          last_client_move_id: null, last_response: null, user_id: userId, user_name: userName,
         });
         return { rows: [], rowCount: 1 };
       }

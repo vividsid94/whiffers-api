@@ -27,20 +27,24 @@ export async function ensureGamesSchema(pool) {
     );
     CREATE INDEX IF NOT EXISTS idx_games_updated_at ON games(updated_at);
     CREATE INDEX IF NOT EXISTS idx_games_daily ON games(daily_date) WHERE mode = 'daily';
+    -- The signed-in player (if any), so the finished game can be saved to
+    -- their account (games/archive.js).
+    ALTER TABLE games ADD COLUMN IF NOT EXISTS user_id TEXT;
+    ALTER TABLE games ADD COLUMN IF NOT EXISTS user_name TEXT;
   `);
 }
 
-export async function insertGame(pool, { id, tokenHash, mode, lexicon, opponentId, dailyDate, state }) {
+export async function insertGame(pool, { id, tokenHash, mode, lexicon, opponentId, dailyDate, state, userId = null, userName = null }) {
   await pool.query(
-    `INSERT INTO games (id, token_hash, mode, lexicon, opponent_id, daily_date, engine_version, state)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-    [id, tokenHash, mode, lexicon, opponentId, dailyDate, state.engineVersion, state],
+    `INSERT INTO games (id, token_hash, mode, lexicon, opponent_id, daily_date, engine_version, state, user_id, user_name)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [id, tokenHash, mode, lexicon, opponentId, dailyDate, state.engineVersion, state, userId, userName],
   );
 }
 
 export async function loadGame(pool, id) {
   const { rows } = await pool.query(
-    'SELECT id, token_hash, state, version, last_client_move_id, last_response FROM games WHERE id = $1',
+    'SELECT id, token_hash, state, version, last_client_move_id, last_response, user_id, user_name FROM games WHERE id = $1',
     [id],
   );
   return rows[0] ?? null;

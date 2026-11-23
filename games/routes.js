@@ -32,6 +32,9 @@ import { runBotTurn, summarizeBotMove, BotUnavailableError } from './bot.js';
 import { classicDeal, dailyDeal, isDailyAvailable, isPlayableDailyDate } from './daily.js';
 import { isValidWord, SUPPORTED_GAME_LEXICONS } from './dictionary.js';
 import { insertGame, loadGame, saveGame } from './repo.js';
+import { saveFinished } from './archive.js';
+import { getRequestUser, publicUser } from '../auth/mount.js';
+import { isAuthOrigin } from '../auth/auth.js';
 import { OPPONENTS, DEFAULT_OPPONENT_ID } from '../rules/opponents.js';
 import {
   createDrawbackState, applyOpeningDeal, prepareHumanTurn, applyHumanDrawbackPlay, applyHumanDrawbackExchange,
@@ -158,14 +161,56 @@ function humanSummary(state) {
   };
 }
 
-export function createGamesRouter(pool) {
+// opts.auth: Better Auth (or null) - a signed-in player's games are recorded
+// against their account. opts.archive: where finished games with a
+// signed-in player are saved (games/archive.js).
+export function createGamesRouter(pool, { auth = null, archive = null } = {}) {
   const router = express.Router();
 
-  router.use(cors({
-    origin: (origin, cb) => cb(null, isAllowedOrigin(origin)),
-    allowedHeaders: ['Content-Type', 'X-Game-Token'],
-    methods: ['GET', 'POST'],
+  // Signed-in requests (cookies) only from the Whiffers sites; everyone else
+  // as before.
+  router.use(cors((req, cb) => {
+    const origin = req.get('Origin');
+    const creds = isAuthOrigin(origin);
+    cb(null, {
+      origin: creds || isAllowedOrigin(origin) ? (origin || true) : false,
+      credentials: creds,
+      allowedHeaders: ['Content-Type', 'X-Game-Token'],
+      methods: ['GET', 'POST'],
+    });
   }));
+
+  async function signedInPlayer(req) {
+    if (!auth) return null;
+    try {
+      const user = await getRequestUser(auth, req);
+      if (!user) return null;
+      return { userId: user.id, userName: publicUser(user).username || user.name || 'Player' };
+    } catch {
+      return null;
+    }
+  }
+
+  // A game that just ended, with a signed-in player: save it to their
+  // account. Never holds up the answer to the player.
+  function archiveIfEnded(row, before, after) {
+    if (!archive || !row.user_id || before.ended || !after.ended) return;
+    const botName = OPPONENTS.find(o => o.id === after.opponentId)?.name ?? 'Wally';
+    saveFinished(archive, {
+      id: row.id,
+      source: 'bot',
+      mode: after.mode,
+      lexicon: after.lexicon,
+      dailyDate: after.dailyDate ?? null,
+      seats: {
+        1: { userId: row.user_id, name: row.user_name, guest: false, botId: null },
+        2: { userId: null, name: botName, guest: false, botId: after.opponentId },
+      },
+      settings: null,
+      state: after,
+      endedAt: Date.now(),
+    });
+  }
   router.use(express.json({ limit: '16kb' }));
 
   const createLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false });
@@ -202,7 +247,8 @@ export function createGamesRouter(pool) {
       assertTileConservation(state);
       const id = crypto.randomUUID();
       const token = crypto.randomBytes(32).toString('base64url');
-      await insertGame(pool, { id, tokenHash: hashToken(token), mode, lexicon, opponentId: opponent, dailyDate: date, state });
+      const player = await signedInPlayer(req);
+      await insertGame(pool, { id, tokenHash: hashToken(token), mode, lexicon, opponentId: opponent, dailyDate: date, state, userId: player?.userId, userName: player?.userName });
       res.status(201).json({ gameId: id, token, state: toClientSnapshot(id, 0, state) });
     } catch (err) {
       next(err);
@@ -287,6 +333,7 @@ export function createGamesRouter(pool) {
       const fresh = await loadGame(pool, row.id);
       throw new HttpError(409, { error: 'version_conflict', state: toClientSnapshot(fresh.id, fresh.version, fresh.state) });
     }
+    archiveIfEnded(row, row.state, final);
     res.json(body);
   }
 
@@ -331,8 +378,12 @@ export function createGamesRouter(pool) {
         if (err instanceof MoveError) throw moveErrorToHttp(err, toClientSnapshot(row.id, row.version, row.state));
         throw err;
       }
+      // reason 'timeout': the player's clock ran out (the browser runs the
+      // clock in games against a bot) - recorded as a loss on time.
+      if (req.body?.reason === 'timeout') ended = { ...ended, endReason: 'timeout' };
       const newVersion = await saveGame(pool, row.id, row.version, ended);
       if (newVersion === null) throw new HttpError(409, { error: 'version_conflict' });
+      archiveIfEnded(row, row.state, ended);
       res.json({ state: toClientSnapshot(row.id, newVersion, ended) });
     } catch (err) {
       next(err);
@@ -366,6 +417,7 @@ export function createGamesRouter(pool) {
         const fresh = await loadGame(pool, row.id);
         throw new HttpError(409, { error: 'version_conflict', state: toClientSnapshot(fresh.id, fresh.version, fresh.state) });
       }
+      archiveIfEnded(row, row.state, final);
       res.json({ bot: summarizeBotMove(row.state, final), state: toClientSnapshot(row.id, newVersion, final) });
     } catch (err) {
       next(err);

@@ -10,6 +10,7 @@ import { buildBoardForRequest, GO_SERVICE_URL } from './rules/boardRequest.js';
 import { createGamesRouter, isAllowedOrigin } from './games/routes.js';
 import { createMultiplayer } from './mp/routes.js';
 import { createPgStore, ensureMultiplayerSchema } from './mp/store.js';
+import { createPgArchive, ensureArchiveSchema } from './games/archive.js';
 import { ensureGamesSchema, cleanupGames } from './games/repo.js';
 import { preloadDictionaries } from './games/dictionary.js';
 import { createAuth } from './auth/auth.js';
@@ -143,7 +144,9 @@ app.set('trust proxy', 1);
 // own credentialed CORS. Off until BETTER_AUTH_SECRET is set, so deploying
 // this before the Railway variables exist doesn't break anything.
 const auth = process.env.BETTER_AUTH_SECRET ? createAuth({ database: pool }) : null;
-if (auth) mountAuth(app, auth);
+// Finished games with a signed-in player, kept for their game history.
+const archive = createPgArchive(pool);
+if (auth) mountAuth(app, auth, process.env, { archive });
 else console.warn('BETTER_AUTH_SECRET not set - accounts are off');
 
 // /games has its own CORS allowlist, body limit and rate limits
@@ -162,9 +165,9 @@ const adminLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHe
 app.use('/admin', adminLimiter);
 app.post('/registry', adminLimiter);
 
-app.use('/games', createGamesRouter(pool));
+app.use('/games', createGamesRouter(pool, { auth, archive }));
 // Multiplayer (mp/, MULTIPLAYER_PLAN.md): its own CORS and body parsing.
-const multiplayer = createMultiplayer({ store: createPgStore(pool), auth, isAllowedOrigin });
+const multiplayer = createMultiplayer({ store: createPgStore(pool), auth, isAllowedOrigin, archive });
 app.use('/mp', multiplayer.router);
 
 async function fetchJson(url) {
@@ -1314,5 +1317,6 @@ const runGameCleanup = () => cleanupGames(pool)
 runGameCleanup();
 setInterval(runGameCleanup, 24 * 60 * 60 * 1000).unref();
 try { await ensureMultiplayerSchema(pool); await multiplayer.resumeTimers(); } catch (err) { console.error('Multiplayer setup failed:', err.message); }
+try { await ensureArchiveSchema(pool); } catch (err) { console.error('Saved-games setup failed:', err.message); }
 const server = app.listen(PORT, () => console.log(`cross-tables-api listening on :${PORT}`));
 multiplayer.attachSockets(server);
