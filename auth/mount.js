@@ -181,7 +181,15 @@ export function mountAuth(app, auth, env = process.env, { archive = null } = {})
       const user = req.profileUser;
       const lines = archive ? await archive.linesForUser(user.id) : [];
       const joined = user.createdAt ? new Date(user.createdAt).getTime() : null;
-      res.json({ profile: { username: publicUser(user).username, joinedAt: joined }, stats: await withCurrentNames(auth, profileStats(lines)) });
+      // Heads Will Roll: best score and which exhibits they've collected
+      // (from their saved progress). Only ids and dates - the page decides
+      // what a visitor may see of each.
+      const hwr = (await readUserData(auth, user.id)).data.hwr;
+      const museum = {
+        best: hwr?.best ?? 0,
+        exhibits: Object.entries(hwr?.exhibits ?? {}).map(([id, e]) => ({ id, at: e.at })).sort((a, b) => b.at.localeCompare(a.at)),
+      };
+      res.json({ profile: { username: publicUser(user).username, joinedAt: joined }, stats: await withCurrentNames(auth, profileStats(lines)), museum });
     } catch (err) {
       console.error('GET /profiles/:username failed:', err.message);
       res.status(500).json({ error: 'Could not load that profile' });

@@ -22,6 +22,10 @@ test('totals, win rate, and averages that skip resigned games', () => {
   assert.equal(s.games, 3);
   assert.equal(s.winRate, 67);
   assert.equal(s.avgScore, 400); // the 30 from the resigned game is left out
+  assert.equal(s.avgOpponentScore, 350);
+  assert.equal(s.avgMargin, 50);
+  assert.equal(s.scoring.biggestWin.margin, 70); // 420-350
+  assert.equal(s.scoring.closestWin.margin, 30); // 380-350
   assert.equal(s.bingos, 4);
   assert.equal(s.bingosPerGame, 1.33);
   assert.equal(s.recent.gamesThisWeek, 2);
@@ -63,5 +67,7 @@ test('no games: zeros and nulls, nothing breaks', () => {
   assert.equal(s.games, 0);
   assert.equal(s.winRate, null);
   assert.equal(s.highlights.bestPlay, null);
+  assert.equal(s.avgOpponentScore, null);
+  assert.equal(s.scoring.biggestWin, null);
   assert.deepEqual(s.streak, { current: 0, longest: 0 });
 });

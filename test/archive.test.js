@@ -20,10 +20,16 @@ const USERS = {
   'u-alice': { id: 'u-alice', name: 'Alice A', email: 'alice@example.com', username: 'alice', displayUsername: 'Alice', createdAt: new Date('2026-11-01T00:00:00Z') },
   'u-bob': { id: 'u-bob', name: 'Bob B', username: 'bob', displayUsername: 'Bob' },
 };
+// Alice's saved progress: two Heads Will Roll exhibits.
+const USER_DATA = {
+  'u-alice': { userId: 'u-alice', data: { v: 1, hwr: { best: 14, exhibits: { q001: { at: '2026-11-10T00:00:00.000Z', seen: true }, q003: { at: '2026-11-12T00:00:00.000Z', seen: false } } } } },
+};
 const fakeAuth = {
   api: { getSession: async ({ headers }) => { const u = USERS[headers.get('x-test-user')]; return u ? { user: u } : null; } },
   // Looking a player up by username (public profiles).
-  $context: Promise.resolve({ adapter: { findOne: async ({ model, where }) => (model === 'user' ? Object.values(USERS).find((u) => u[where[0].field] === where[0].value) ?? null : null) } }),
+  $context: Promise.resolve({ adapter: { findOne: async ({ model, where }) => (model === 'user'
+    ? Object.values(USERS).find((u) => u[where[0].field] === where[0].value) ?? null
+    : model === 'userData' ? USER_DATA[where[0].value] ?? null : null) } }),
   handler: async () => new Response('not here', { status: 404 }),
 };
 
@@ -208,6 +214,9 @@ test('public profile: stats and games for anyone, nothing private', async () => 
     assert.deepEqual(st.records.people.opponents.map((o) => o.name), ['Guest']);
     assert.equal(st.modes.classic.games, 2);
     assert.equal(st.trend.length, 0); // both games ended in a resignation
+    // Heads Will Roll museum: best score and collected exhibits, newest first.
+    assert.deepEqual(res.body.museum, { best: 14, exhibits: [{ id: 'q003', at: '2026-11-12T00:00:00.000Z' }, { id: 'q001', at: '2026-11-10T00:00:00.000Z' }] });
+    assert.deepEqual((await call(srv.base, 'GET', '/profiles/bob')).body.museum, { best: 0, exhibits: [] });
     // Never the email or the Google name.
     const raw = JSON.stringify(res.body);
     assert.equal(raw.includes('alice@example.com'), false);

@@ -38,6 +38,15 @@ export function profileStats(lines, now = Date.now()) {
   for (const g of lines) { if (g.result !== 'win') break; current++; }
 
   const last30 = lines.filter((g) => g.endedAt > now - 30 * DAY);
+  // Margins (your score minus theirs) over played-out games.
+  const margin = (g) => g.you.score - g.them.score;
+  const wins = scored.filter((g) => g.result === 'win');
+  let biggestWin = null;
+  let closestWin = null;
+  for (const g of wins) {
+    if (!biggestWin || margin(g) > margin(biggestWin)) biggestWin = g;
+    if (!closestWin || margin(g) < margin(closestWin)) closestWin = g;
+  }
   const bestGame = best(lines, (g) => g.you.score);
   const bestPlay = best(lines, (g) => g.bestPlay?.score);
   const mostBingos = best(lines, (g) => g.bingos);
@@ -76,6 +85,12 @@ export function profileStats(lines, now = Date.now()) {
     ...overall,
     winRate: pct(overall.wins, games),
     avgScore: avg(scored.map((g) => g.you.score)),
+    avgOpponentScore: avg(scored.map((g) => g.them.score)),
+    avgMargin: avg(scored.map(margin)),
+    scoring: {
+      biggestWin: biggestWin && { margin: margin(biggestWin), game: ref(biggestWin) },
+      closestWin: closestWin && { margin: margin(closestWin), game: ref(closestWin) },
+    },
     bingos,
     bingosPerGame: games ? Math.round((bingos / games) * 100) / 100 : null,
     lastPlayedAt: lines[0]?.endedAt ?? null,
